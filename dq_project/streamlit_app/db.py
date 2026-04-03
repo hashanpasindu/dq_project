@@ -61,9 +61,26 @@ def dq_schema_fqn(catalog: str | None = None) -> str:
     return f"`{cat}`.`data_quality`"
 
 
+def detect_env(catalog: str | None = None) -> str:
+    """Detect environment key from catalog name."""
+    cat = (catalog or get_dq_catalog() or "").lower()
+    if "prod" in cat:
+        return "prod"
+    if "uat" in cat or "test" in cat:
+        return "uat"
+    if "dev" in cat:
+        return "dev"
+    return "dev"
+
+
+def dq_table_name(base_name: str, catalog: str | None = None) -> str:
+    """Return environment-scoped table name (e.g. rules_dev)."""
+    return f"{base_name}_{detect_env(catalog)}"
+
+
 def dq_table(name: str, catalog: str | None = None) -> str:
     """Return fully qualified DQ table path."""
-    return f"{dq_schema_fqn(catalog)}.`{name}`"
+    return f"{dq_schema_fqn(catalog)}.`{dq_table_name(name, catalog)}`"
 
 
 def ensure_results_table_shape(catalog: str | None = None) -> tuple[bool, list[str]]:
@@ -214,9 +231,14 @@ def get_table_sample(table_name: str, limit: int = 2) -> tuple[list[str], list[t
 def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
     """Create all backend tables if they don't exist."""
     schema = dq_schema_fqn(catalog)
+    rules_tbl = dq_table_name("rules", catalog)
+    results_tbl = dq_table_name("results", catalog)
+    audit_tbl = dq_table_name("rule_audit", catalog)
+    alert_cfg_tbl = dq_table_name("alert_config", catalog)
+    alert_log_tbl = dq_table_name("alert_log", catalog)
     ddls = [
         f"CREATE SCHEMA IF NOT EXISTS {schema}",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`rules` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`{rules_tbl}` (
             rule_id STRING NOT NULL, rule_name STRING NOT NULL,
             dataset STRING NOT NULL, rule_type STRING NOT NULL,
             rule_sql STRING NOT NULL, severity STRING NOT NULL,
@@ -227,7 +249,7 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             created_by STRING, created_at TIMESTAMP DEFAULT current_timestamp(),
             updated_by STRING, updated_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`results` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`{results_tbl}` (
             run_id STRING NOT NULL, run_type STRING DEFAULT 'scheduled',
             rule_id STRING NOT NULL, dataset STRING NOT NULL,
             rule_name STRING NOT NULL, rule_type STRING NOT NULL,
@@ -235,13 +257,13 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             error_message STRING, result_value STRING,
             execution_time_sec DOUBLE, checked_at TIMESTAMP NOT NULL
         ) USING DELTA PARTITIONED BY (checked_at) TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`rule_audit` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`{audit_tbl}` (
             audit_id STRING NOT NULL, rule_id STRING NOT NULL,
             action STRING NOT NULL, field_changed STRING,
             old_value STRING, new_value STRING,
             changed_by STRING, changed_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`alert_config` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`{alert_cfg_tbl}` (
             config_id STRING NOT NULL, channel_type STRING NOT NULL,
             channel_name STRING NOT NULL, webhook_url STRING,
             smtp_server STRING, smtp_port INT, email_from STRING, email_to STRING,
@@ -250,7 +272,7 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             created_at TIMESTAMP DEFAULT current_timestamp(),
             updated_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`alert_log` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`{alert_log_tbl}` (
             alert_id STRING NOT NULL, run_id STRING NOT NULL,
             config_id STRING NOT NULL, channel_type STRING NOT NULL,
             num_failures INT NOT NULL, num_critical INT, num_warnings INT,
@@ -431,12 +453,16 @@ def _replace_catalog_refs(text: str, old_catalog: str, new_catalog: str) -> str:
         return text
 
     old_esc = re.escape(old_catalog)
-    out = re.sub(rf"`{old_esc}`\\.", f"`{new_catalog}`.", text)
-    out = re.sub(rf"(?<![A-Za-z0-9_]){old_esc}\\.", f"{new_catalog}.", out)
+    out = re.sub(rf"`{old_esc}`\\.", f"`{new_catalog}`.", text, flags=re.IGNORECASE)
+    out = re.sub(rf"(?<![A-Za-z0-9_]){old_esc}\\.", f"{new_catalog}.", out, flags=re.IGNORECASE)
     return out
 
 
-def remap_rule_catalog_references(old_catalog: str, new_catalog: str) -> tuple[int, int, list[str]]:
+def remap_rule_catalog_references(
+    old_catalog: str,
+    new_catalog: str,
+    rule_ids: list[str] | None = None,
+) -> tuple[int, int, list[str]]:
     """Update stored rules to point from one data catalog to another."""
     old_catalog = (old_catalog or "").strip()
     new_catalog = (new_catalog or "").strip()
@@ -444,9 +470,16 @@ def remap_rule_catalog_references(old_catalog: str, new_catalog: str) -> tuple[i
         return 0, 0, ["Both source and target catalogs are required"]
     if old_catalog == new_catalog:
         return 0, 0, ["Source and target catalogs are the same"]
+    if rule_ids is not None and not rule_ids:
+        return 0, 0, ["Select at least one rule to promote"]
 
     rules_tbl = dq_table("rules")
-    _, rows = run_sql(f"SELECT rule_id, dataset, rule_sql FROM {rules_tbl}")
+    query = f"SELECT rule_id, dataset, rule_sql FROM {rules_tbl}"
+    if rule_ids is not None:
+        esc = lambda s: (s or "").replace("\\", "\\\\").replace("'", "\\'")
+        rule_id_list = ", ".join(f"'{esc(rule_id)}'" for rule_id in rule_ids)
+        query += f" WHERE rule_id IN ({rule_id_list})"
+    _, rows = run_sql(query)
     rows = rows or []
 
     checked = len(rows)

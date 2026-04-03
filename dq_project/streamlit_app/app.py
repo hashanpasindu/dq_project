@@ -250,15 +250,15 @@ if not st.session_state.connected:
     st.markdown("# 🛡️ Data Quality Rule Builder")
     st.info("👈 Connect to your Databricks workspace using the sidebar to get started.")
     st.markdown("""
-    **Backend tables created automatically on connect:**
+    **Backend tables created automatically on connect (env-scoped):**
 
     | Table | Purpose |
     |-------|---------|
-    | `data_quality.rules` | Rule definitions (what to check) |
-    | `data_quality.results` | Validation run history (append-only) |
-    | `data_quality.rule_audit` | Who changed what, when |
-    | `data_quality.alert_config` | Alert channel settings |
-    | `data_quality.alert_log` | Alert delivery log |
+    | `data_quality.rules_<env>` | Rule definitions (what to check) |
+    | `data_quality.results_<env>` | Validation run history (append-only) |
+    | `data_quality.rule_audit_<env>` | Who changed what, when |
+    | `data_quality.alert_config_<env>` | Alert channel settings |
+    | `data_quality.alert_log_<env>` | Alert delivery log |
     """)
     st.stop()
 
@@ -494,25 +494,6 @@ if page == "🏗️ Build Rules":
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "📋 Manage Rules":
     st.markdown("## 📋 Manage Existing Rules")
-
-    with st.expander("🚚 Promote Rules: Dev → Test → Prod", expanded=False):
-        st.caption("Bulk replace catalog references inside dataset and rule SQL for all saved rules.")
-        p1, p2 = st.columns(2)
-        with p1:
-            source_catalog = st.text_input("Source Data Catalog", placeholder="dev_catalog", key="promote_src")
-        with p2:
-            target_catalog = st.text_input("Target Data Catalog", placeholder="test_catalog", key="promote_tgt")
-
-        if st.button("🔁 Remap Catalog In Rules", type="primary", use_container_width=True):
-            checked, updated, errs = remap_rule_catalog_references(source_catalog, target_catalog)
-            if errs:
-                st.warning(f"Checked {checked} rules · Updated {updated} · Errors {len(errs)}")
-                with st.expander("Show remap errors"):
-                    for e in errs:
-                        st.code(e)
-            else:
-                st.success(f"Checked {checked} rules · Updated {updated}")
-
     try:
         _, rows = get_all_rules()
     except Exception as e:
@@ -522,6 +503,90 @@ elif page == "📋 Manage Rules":
     if not rows:
         st.info("No rules found. Go to **Build Rules** to create your first rule.")
         st.stop()
+
+    st.markdown("### 🚚 Promote Rules: Dev → Test → Prod")
+    st.caption("Search rules by table name, pick the rules to promote, then replace the data catalog inside dataset and rule SQL.")
+
+    promote_filter = st.text_input(
+        "🔎 Search Table Name For Promotion",
+        placeholder="orders, customers, invoice_lines...",
+        key="promote_table_search",
+    ).strip().lower()
+
+    promote_candidates = []
+    for row in rows:
+        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
+        haystack = " ".join(str(x or "") for x in [ds, rname, rsql]).lower()
+        if promote_filter and promote_filter not in haystack:
+            continue
+        promote_candidates.append((rid, ds, rname))
+
+    promote_options = [
+        f"{rid} | {dataset} | {rule_name}"
+        for rid, dataset, rule_name in promote_candidates
+    ]
+    promote_option_to_id = {
+        f"{rid} | {dataset} | {rule_name}": rid
+        for rid, dataset, rule_name in promote_candidates
+    }
+    rule_lookup = {row[0]: row for row in rows}
+
+    selected_promotion_options = st.multiselect(
+        "Select Rules To Promote",
+        options=promote_options,
+        placeholder="Choose one or more rules",
+    )
+
+    p1, p2 = st.columns(2)
+    with p1:
+        source_catalog = st.text_input("Source Data Catalog", placeholder="dev_catalog", key="promote_src")
+    with p2:
+        target_catalog = st.text_input("Target Data Catalog", placeholder="test_catalog", key="promote_tgt")
+
+    selected_rule_ids = [promote_option_to_id[x] for x in selected_promotion_options]
+
+    if selected_rule_ids:
+        preview_rows = []
+        source_catalog_lc = source_catalog.strip().lower()
+        for rule_id in selected_rule_ids:
+            row = rule_lookup.get(rule_id)
+            if not row:
+                continue
+            dataset = str(row[1] or "")
+            rule_sql = str(row[4] or "")
+            source_in_dataset = bool(source_catalog_lc) and f"{source_catalog_lc}." in dataset.lower()
+            source_in_sql = bool(source_catalog_lc) and f"{source_catalog_lc}." in rule_sql.lower()
+            preview_rows.append({
+                "Rule ID": rule_id,
+                "Dataset": dataset,
+                "Source In Dataset": source_in_dataset,
+                "Source In SQL": source_in_sql,
+            })
+
+        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+        if source_catalog.strip() and not any(r["Source In Dataset"] or r["Source In SQL"] for r in preview_rows):
+            st.warning("The selected rules do not currently contain the source catalog. For a dev to test promotion, source should be the current catalog in the rule and target should be the new catalog.")
+
+    if st.button("🔁 Remap Catalog In Selected Rules", type="primary", use_container_width=True):
+        checked, updated, errs = remap_rule_catalog_references(
+            source_catalog,
+            target_catalog,
+            rule_ids=selected_rule_ids,
+        )
+        if errs:
+            st.warning(f"Checked {checked} rules · Updated {updated} · Errors {len(errs)}")
+            with st.expander("Show remap errors"):
+                for e in errs:
+                    st.code(e)
+        elif checked > 0 and updated == 0:
+            st.warning("Checked selected rules, but none contained the source catalog to replace. Verify source and target order.")
+        else:
+            st.success(f"Checked {checked} rules · Updated {updated}")
+
+    if not promote_candidates:
+        st.info("No rules matched the table-name search for promotion.")
+
+    st.divider()
 
     total = len(rows)
     active = sum(1 for r in rows if r[8])

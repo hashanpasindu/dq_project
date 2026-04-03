@@ -22,12 +22,36 @@ from pyspark.sql import Row
 RUN_ID = str(uuid.uuid4())[:8]
 CHECKED_AT = datetime.now()
 
+dbutils.widgets.text("dq_catalog", "hive_metastore")
+DQ_CATALOG = dbutils.widgets.get("dq_catalog").strip() or "hive_metastore"
+
+
+def detect_env(catalog_name: str) -> str:
+    c = (catalog_name or "").lower()
+    if "prod" in c:
+        return "prod"
+    if "uat" in c or "test" in c:
+        return "uat"
+    if "dev" in c:
+        return "dev"
+    return "dev"
+
+
+ENV_KEY = detect_env(DQ_CATALOG)
+DQ_SCHEMA = f"`{DQ_CATALOG}`.`data_quality`"
+RULES_TBL = f"{DQ_SCHEMA}.`rules_{ENV_KEY}`"
+RESULTS_TBL = f"{DQ_SCHEMA}.`results_{ENV_KEY}`"
+AUDIT_TBL = f"{DQ_SCHEMA}.`rule_audit_{ENV_KEY}`"
+ALERT_CFG_TBL = f"{DQ_SCHEMA}.`alert_config_{ENV_KEY}`"
+ALERT_LOG_TBL = f"{DQ_SCHEMA}.`alert_log_{ENV_KEY}`"
+
 print(f"🚀 DQ Validation Run: {RUN_ID} at {CHECKED_AT}")
+print(f"📦 Catalog: {DQ_CATALOG} | Env: {ENV_KEY}")
 
 # COMMAND ----------
 
 # DBTITLE 1,Load active rules
-rules_df = spark.sql("SELECT * FROM data_quality.rules WHERE active = true ORDER BY rule_id")
+rules_df = spark.sql(f"SELECT * FROM {RULES_TBL} WHERE active = true ORDER BY rule_id")
 rules = rules_df.collect()
 print(f"📋 Loaded {len(rules)} active rules")
 
@@ -70,7 +94,7 @@ for rule in rules:
 
     # Update last_run status on the rule
     spark.sql(f"""
-        UPDATE data_quality.rules
+        UPDATE {RULES_TBL}
         SET last_run_at = current_timestamp(),
             last_run_passed = {str(passed).lower()}
         WHERE rule_id = '{rule.rule_id}'
@@ -78,7 +102,7 @@ for rule in rules:
 
 # Write all results
 results_df = spark.createDataFrame(results)
-results_df.write.mode("append").saveAsTable("data_quality.results")
+results_df.write.mode("append").saveAsTable(f"{DQ_CATALOG}.data_quality.results_{ENV_KEY}")
 
 print(f"\n{'='*80}")
 failures = [r for r in results if not r.passed]
@@ -160,7 +184,7 @@ def send_email_alert(config, failures, run_id, total):
 # ── Load alert configs and send ──
 if failures:
     alert_configs = spark.sql(
-        "SELECT * FROM data_quality.alert_config WHERE active = true AND is_default = true"
+        f"SELECT * FROM {ALERT_CFG_TBL} WHERE active = true AND is_default = true"
     ).collect()
 
     for ac in alert_configs:
@@ -185,7 +209,7 @@ if failures:
 
         # Log the alert
         spark.sql(f"""
-            INSERT INTO data_quality.alert_log VALUES (
+            INSERT INTO {ALERT_LOG_TBL} VALUES (
                 '{alert_id}', '{RUN_ID}', '{ac.config_id}', '{ac.channel_type}',
                 {len(failures)}, {critical_n}, {warning_n},
                 '{len(failures)} DQ failures detected', '{status}',
