@@ -5,6 +5,7 @@ All database interactions go through this module.
 
 import time
 import uuid
+import re
 import streamlit as st
 from databricks import sql as dbx_sql
 
@@ -422,3 +423,64 @@ def get_audit_log(limit: int = 50):
         FROM {audit_tbl}
         ORDER BY changed_at DESC LIMIT {limit}
     """)
+
+
+def _replace_catalog_refs(text: str, old_catalog: str, new_catalog: str) -> str:
+    """Replace catalog qualifiers in SQL/table strings."""
+    if not text:
+        return text
+
+    old_esc = re.escape(old_catalog)
+    out = re.sub(rf"`{old_esc}`\\.", f"`{new_catalog}`.", text)
+    out = re.sub(rf"(?<![A-Za-z0-9_]){old_esc}\\.", f"{new_catalog}.", out)
+    return out
+
+
+def remap_rule_catalog_references(old_catalog: str, new_catalog: str) -> tuple[int, int, list[str]]:
+    """Update stored rules to point from one data catalog to another."""
+    old_catalog = (old_catalog or "").strip()
+    new_catalog = (new_catalog or "").strip()
+    if not old_catalog or not new_catalog:
+        return 0, 0, ["Both source and target catalogs are required"]
+    if old_catalog == new_catalog:
+        return 0, 0, ["Source and target catalogs are the same"]
+
+    rules_tbl = dq_table("rules")
+    _, rows = run_sql(f"SELECT rule_id, dataset, rule_sql FROM {rules_tbl}")
+    rows = rows or []
+
+    checked = len(rows)
+    updated = 0
+    errors = []
+
+    for rid, dataset, rule_sql in rows:
+        new_dataset = _replace_catalog_refs(dataset or "", old_catalog, new_catalog)
+        new_rule_sql = _replace_catalog_refs(rule_sql or "", old_catalog, new_catalog)
+
+        if new_dataset == (dataset or "") and new_rule_sql == (rule_sql or ""):
+            continue
+
+        esc = lambda s: (s or "").replace("\\", "\\\\").replace("'", "\\'")
+        try:
+            run_sql(
+                f"""
+                UPDATE {rules_tbl}
+                SET dataset='{esc(new_dataset)}',
+                    rule_sql='{esc(new_rule_sql)}',
+                    updated_at=current_timestamp()
+                WHERE rule_id='{esc(rid)}'
+                """,
+                fetch=False,
+            )
+            log_audit(
+                rid,
+                "CATALOG_REMAP",
+                field_changed="dataset,rule_sql",
+                old_value=f"{old_catalog}",
+                new_value=f"{new_catalog}",
+            )
+            updated += 1
+        except Exception as e:
+            errors.append(f"{rid}: {e}")
+
+    return checked, updated, errors

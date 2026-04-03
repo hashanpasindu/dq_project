@@ -12,7 +12,7 @@ from db import (
     test_connection, discover_catalogs, discover_schemas, discover_tables_in_schema,
     discover_columns, get_table_sample, ensure_dq_schema,
     push_rule, toggle_rule, delete_rule, get_all_rules, test_rule,
-    get_latest_run, get_daily_trend, get_audit_log,
+    get_latest_run, get_daily_trend, get_audit_log, remap_rule_catalog_references,
 )
 from templates import TEMPLATES
 
@@ -133,6 +133,25 @@ with st.sidebar:
 
     if st.session_state.connected:
         st.success(f"Connected · {len(st.session_state.catalogs)} catalogs")
+        current_dq_catalog = st.session_state.dbx_config.get("dq_catalog", "")
+        st.caption(f"Rules Catalog: {current_dq_catalog}")
+
+        if dq_catalog.strip() and dq_catalog.strip() != current_dq_catalog:
+            if st.button("🧭 Apply Rules Catalog", use_container_width=True):
+                with st.spinner("Switching rules catalog..."):
+                    schema_ok, schema_errors = ensure_dq_schema(dq_catalog.strip())
+                if not schema_ok:
+                    st.error("Failed to switch rules catalog.")
+                    with st.expander("Show catalog switch errors"):
+                        for err in schema_errors:
+                            st.code(err)
+                else:
+                    st.session_state.dbx_config["dq_catalog"] = dq_catalog.strip()
+                    if remember:
+                        save_config(st.session_state.dbx_config)
+                        st.session_state.saved_config = st.session_state.dbx_config
+                    st.success(f"Rules catalog switched to: {dq_catalog.strip()}")
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🔄 Refresh", use_container_width=True):
@@ -475,6 +494,25 @@ if page == "🏗️ Build Rules":
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "📋 Manage Rules":
     st.markdown("## 📋 Manage Existing Rules")
+
+    with st.expander("🚚 Promote Rules: Dev → Test → Prod", expanded=False):
+        st.caption("Bulk replace catalog references inside dataset and rule SQL for all saved rules.")
+        p1, p2 = st.columns(2)
+        with p1:
+            source_catalog = st.text_input("Source Data Catalog", placeholder="dev_catalog", key="promote_src")
+        with p2:
+            target_catalog = st.text_input("Target Data Catalog", placeholder="test_catalog", key="promote_tgt")
+
+        if st.button("🔁 Remap Catalog In Rules", type="primary", use_container_width=True):
+            checked, updated, errs = remap_rule_catalog_references(source_catalog, target_catalog)
+            if errs:
+                st.warning(f"Checked {checked} rules · Updated {updated} · Errors {len(errs)}")
+                with st.expander("Show remap errors"):
+                    for e in errs:
+                        st.code(e)
+            else:
+                st.success(f"Checked {checked} rules · Updated {updated}")
+
     try:
         _, rows = get_all_rules()
     except Exception as e:
