@@ -101,12 +101,20 @@ Import `notebooks/dq_validation_runner.py` into Databricks and schedule as a Wor
 Required job parameter:
 
 - `dq_catalog`: catalog to run against (for example `aa_data_dev`, `aa_data_dev_test`, `aa_data_prod`)
+- `pipeline_tables` (optional): comma/semicolon/newline separated table names to run only relevant rules
 
 Runner behavior:
 
 - Reads from `data_quality.rules_<env>` in the provided catalog
 - Writes to `data_quality.results_<env>`
 - Uses matching env-scoped alert and audit tables
+- If `pipeline_tables` is provided, only rules whose `dataset` matches those tables are executed
+
+`pipeline_tables` examples:
+
+- `aa_data_dev.gold.avaya_user_activity`
+- `aa_data_dev.gold.avaya_user_activity,aa_data_dev.gold.orders`
+- `gold.avaya_user_activity;gold.orders`
 
 ## Promotion (Dev/Test/UAT/Prod)
 

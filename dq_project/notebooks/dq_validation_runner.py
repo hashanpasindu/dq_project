@@ -14,6 +14,7 @@ import json
 import smtplib
 import uuid
 import time
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -24,6 +25,8 @@ CHECKED_AT = datetime.now()
 
 dbutils.widgets.text("dq_catalog", "hive_metastore")
 DQ_CATALOG = dbutils.widgets.get("dq_catalog").strip() or "hive_metastore"
+dbutils.widgets.text("pipeline_tables", "")
+PIPELINE_TABLES_RAW = dbutils.widgets.get("pipeline_tables").strip()
 
 
 def detect_env(catalog_name: str) -> str:
@@ -48,12 +51,52 @@ ALERT_LOG_TBL = f"{DQ_SCHEMA}.`alert_log_{ENV_KEY}`"
 print(f"🚀 DQ Validation Run: {RUN_ID} at {CHECKED_AT}")
 print(f"📦 Catalog: {DQ_CATALOG} | Env: {ENV_KEY}")
 
+
+def normalize_table_name(name: str) -> str:
+    return (name or "").replace("`", "").strip().lower()
+
+
+def build_match_keys(name: str) -> set[str]:
+    norm = normalize_table_name(name)
+    if not norm:
+        return set()
+    parts = norm.split(".")
+    keys = {norm}
+    if len(parts) >= 2:
+        keys.add(".".join(parts[-2:]))
+    keys.add(parts[-1])
+    return keys
+
+
+pipeline_inputs = [
+    p.strip()
+    for p in re.split(r"[,;\n]", PIPELINE_TABLES_RAW)
+    if p.strip()
+]
+
+pipeline_match_set = set()
+for item in pipeline_inputs:
+    pipeline_match_set.update(build_match_keys(item))
+
+RUN_TYPE = "pipeline" if pipeline_match_set else "scheduled"
+if pipeline_match_set:
+    print(f"🎯 Pipeline table filter enabled ({len(pipeline_inputs)} inputs)")
+
 # COMMAND ----------
 
 # DBTITLE 1,Load active rules
 rules_df = spark.sql(f"SELECT * FROM {RULES_TBL} WHERE active = true ORDER BY rule_id")
-rules = rules_df.collect()
-print(f"📋 Loaded {len(rules)} active rules")
+rules_all = rules_df.collect()
+
+if pipeline_match_set:
+    rules = [
+        r for r in rules_all
+        if bool(build_match_keys(r.dataset or "") & pipeline_match_set)
+    ]
+    print(f"📋 Loaded {len(rules_all)} active rules | {len(rules)} matched pipeline tables")
+else:
+    rules = rules_all
+    print(f"📋 Loaded {len(rules)} active rules")
 
 # COMMAND ----------
 
@@ -78,7 +121,7 @@ for rule in rules:
 
     results.append(Row(
         run_id=RUN_ID,
-        run_type="scheduled",
+        run_type=RUN_TYPE,
         rule_id=rule.rule_id,
         dataset=rule.dataset,
         rule_name=rule.rule_name,
@@ -101,8 +144,11 @@ for rule in rules:
     """)
 
 # Write all results
-results_df = spark.createDataFrame(results)
-results_df.write.mode("append").saveAsTable(f"{DQ_CATALOG}.data_quality.results_{ENV_KEY}")
+if results:
+    results_df = spark.createDataFrame(results)
+    results_df.write.mode("append").saveAsTable(f"{DQ_CATALOG}.data_quality.results_{ENV_KEY}")
+else:
+    print("ℹ️ No rules matched pipeline filter. Nothing to execute.")
 
 print(f"\n{'='*80}")
 failures = [r for r in results if not r.passed]
