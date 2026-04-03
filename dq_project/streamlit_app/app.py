@@ -1,0 +1,614 @@
+"""
+🛡️ DQ Rule Builder — Streamlit App
+═══════════════════════════════════════
+streamlit run app.py
+"""
+
+import streamlit as st
+import uuid
+import time
+from config import load_config, save_config
+from db import (
+    test_connection, discover_catalogs, discover_schemas, discover_tables_in_schema,
+    discover_columns, get_table_sample, ensure_dq_schema,
+    push_rule, toggle_rule, delete_rule, get_all_rules, test_rule,
+    get_latest_run, get_daily_trend, get_audit_log,
+)
+from templates import TEMPLATES
+
+# ─── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="DQ Rule Builder", page_icon="🛡️", layout="wide")
+
+st.markdown("""
+<style>
+    .stApp { background: #0b1120; }
+    section[data-testid="stSidebar"] {
+        background: #0f1729; border-right: 1px solid #1c2940;
+    }
+    .block-container { padding-top: 1.5rem; }
+    #MainMenu, footer, header { visibility: hidden; }
+
+    .sql-box {
+        background: #030712; border: 1px solid #1e40af30;
+        border-radius: 10px; padding: 14px 18px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 13px; color: #7dd3fc; line-height: 1.7;
+        word-break: break-all; margin: 8px 0;
+    }
+    .card {
+        background: #111827; border: 1px solid #1f2937;
+        border-radius: 12px; padding: 16px 20px; margin-bottom: 10px;
+    }
+    .card-pass {
+        background: #071a12; border: 1px solid #16a34a50;
+        border-radius: 10px; padding: 12px 16px; margin: 6px 0;
+    }
+    .card-fail {
+        background: #1a0808; border: 1px solid #dc262650;
+        border-radius: 10px; padding: 12px 16px; margin: 6px 0;
+    }
+    .stat-box {
+        text-align: center; padding: 18px 12px;
+        border-radius: 12px; background: #111827;
+        border: 1px solid #1f2937;
+    }
+    .stat-num { font-size: 36px; font-weight: 800; }
+    .stat-label { font-size: 12px; color: #64748b; margin-top: 4px;
+                  text-transform: uppercase; letter-spacing: 1px; }
+    .sev-critical { background: #dc262615; color: #ef4444; border: 1px solid #ef444430;
+                    padding: 2px 10px; border-radius: 6px; font-size: 11px;
+                    font-weight: 800; text-transform: uppercase; }
+    .sev-warning { background: #f59e0b15; color: #f59e0b; border: 1px solid #f59e0b30;
+                   padding: 2px 10px; border-radius: 6px; font-size: 11px;
+                   font-weight: 800; text-transform: uppercase; }
+    .sev-info { background: #64748b15; color: #94a3b8; border: 1px solid #94a3b830;
+                padding: 2px 10px; border-radius: 6px; font-size: 11px;
+                font-weight: 800; text-transform: uppercase; }
+    .tag { background: #1e293b; color: #94a3b8; padding: 3px 10px;
+           border-radius: 6px; font-size: 12px; font-family: monospace; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─── Session State Init ─────────────────────────────────────────────────────
+if "connected" not in st.session_state:
+    st.session_state.connected = False
+    st.session_state.tables = []
+    st.session_state.catalogs = []
+    st.session_state.schema_cache = {}
+    st.session_state.table_cache = {}
+    st.session_state.col_cache = {}
+    st.session_state.rule_queue = []
+    st.session_state.saved_config = load_config()
+
+
+# ─── Helper ──────────────────────────────────────────────────────────────────
+def get_cols(table_name):
+    if table_name not in st.session_state.col_cache:
+        st.session_state.col_cache[table_name] = discover_columns(table_name)
+    return st.session_state.col_cache[table_name]
+
+
+def get_schemas_for_catalog(catalog_name):
+    if not catalog_name:
+        return []
+    if catalog_name not in st.session_state.schema_cache:
+        cfg = st.session_state.dbx_config
+        st.session_state.schema_cache[catalog_name] = discover_schemas(
+            cfg["hostname"], cfg["http_path"], cfg["token"], catalog_name
+        )
+    return st.session_state.schema_cache.get(catalog_name, [])
+
+
+def get_tables_for_scope(catalog_name, schema_name):
+    if not (catalog_name and schema_name):
+        return []
+    cache_key = f"{catalog_name}.{schema_name}"
+    if cache_key not in st.session_state.table_cache:
+        cfg = st.session_state.dbx_config
+        st.session_state.table_cache[cache_key] = discover_tables_in_schema(
+            cfg["hostname"], cfg["http_path"], cfg["token"], catalog_name, schema_name
+        )
+    return st.session_state.table_cache.get(cache_key, [])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("# 🛡️ DQ Rule Builder")
+    st.caption("Local → Databricks")
+    st.divider()
+
+    saved = st.session_state.saved_config
+    hostname = st.text_input("Server Hostname", value=saved.get("hostname", ""),
+                             placeholder="adb-xxxx.azuredatabricks.net")
+    http_path = st.text_input("HTTP Path", value=saved.get("http_path", ""),
+                              placeholder="/sql/1.0/warehouses/xxx")
+    dq_catalog = st.text_input("DQ Catalog", value=saved.get("dq_catalog", ""),
+                               placeholder="hive_metastore")
+    token = st.text_input("PAT Token", value=saved.get("token", ""),
+                          type="password", placeholder="dapi...")
+    remember = st.checkbox("Remember connection", value=bool(saved))
+
+    if st.session_state.connected:
+        st.success(f"Connected · {len(st.session_state.catalogs)} catalogs")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.session_state.col_cache = {}
+                st.session_state.schema_cache = {}
+                st.session_state.table_cache = {}
+                st.session_state.tables = []
+                cfg = st.session_state.dbx_config
+                with st.spinner("Refreshing..."):
+                    st.session_state.catalogs = discover_catalogs(cfg["hostname"], cfg["http_path"], cfg["token"])
+                st.rerun()
+        with c2:
+            if st.button("🔌 Disconnect", use_container_width=True):
+                st.session_state.connected = False
+                st.session_state.tables = []
+                st.session_state.catalogs = []
+                st.session_state.schema_cache = {}
+                st.session_state.table_cache = {}
+                st.rerun()
+    else:
+        if st.button("⚡ Connect", type="primary", use_container_width=True):
+            if not all([hostname, http_path, token]):
+                st.error("Fill in all fields")
+            elif not dq_catalog.strip():
+                st.error("DQ Catalog is required")
+            else:
+                with st.spinner("Connecting..."):
+                    ok, msg = test_connection(hostname, http_path, token)
+                if not ok:
+                    st.error(f"Failed: {msg}")
+                else:
+                    cfg = {
+                        "hostname": hostname,
+                        "http_path": http_path,
+                        "token": token,
+                        "dq_catalog": dq_catalog.strip(),
+                    }
+                    st.session_state.dbx_config = cfg
+                    with st.spinner("Loading catalogs & creating DQ schema..."):
+                        st.session_state.catalogs = discover_catalogs(hostname, http_path, token)
+                        st.session_state.tables = []
+                        st.session_state.schema_cache = {}
+                        st.session_state.table_cache = {}
+                        schema_ok, schema_errors = ensure_dq_schema(cfg["dq_catalog"])
+                    if not schema_ok:
+                        st.error("Connected, but failed to create one or more backend tables.")
+                        with st.expander("Show bootstrap errors"):
+                            for err in schema_errors:
+                                st.code(err)
+                    else:
+                        st.session_state.connected = True
+                        if remember:
+                            save_config(cfg)
+                            st.session_state.saved_config = cfg
+                        st.rerun()
+
+    st.divider()
+    page = st.radio("Navigate", [
+        "🏗️ Build Rules",
+        "📋 Manage Rules",
+        "📊 Run History",
+        "📝 Audit Log",
+    ], label_visibility="collapsed")
+
+    # Queue indicator
+    q = st.session_state.rule_queue
+    if q:
+        st.divider()
+        st.markdown(f"### 📝 Queue: {len(q)}")
+        if st.button("🚀 Push All", type="primary", use_container_width=True):
+            bar = st.progress(0)
+            ok_n, errs = 0, []
+            for i, r in enumerate(q):
+                ok, err = push_rule(r)
+                ok_n += 1 if ok else 0
+                if err:
+                    errs.append(f"{r['rule_id']}: {err}")
+                bar.progress((i + 1) / len(q))
+            bar.empty()
+            if errs:
+                st.warning(f"✅ {ok_n} ok · ❌ {len(errs)} failed")
+            else:
+                st.success(f"✅ All {ok_n} pushed!")
+                st.session_state.rule_queue = []
+                time.sleep(0.5)
+                st.rerun()
+        if st.button("🗑️ Clear Queue", use_container_width=True):
+            st.session_state.rule_queue = []
+            st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GUARD — must be connected
+# ═════════════════════════════════════════════════════════════════════════════
+if not st.session_state.connected:
+    st.markdown("# 🛡️ Data Quality Rule Builder")
+    st.info("👈 Connect to your Databricks workspace using the sidebar to get started.")
+    st.markdown("""
+    **Backend tables created automatically on connect:**
+
+    | Table | Purpose |
+    |-------|---------|
+    | `data_quality.rules` | Rule definitions (what to check) |
+    | `data_quality.results` | Validation run history (append-only) |
+    | `data_quality.rule_audit` | Who changed what, when |
+    | `data_quality.alert_config` | Alert channel settings |
+    | `data_quality.alert_log` | Alert delivery log |
+    """)
+    st.stop()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: BUILD RULES
+# ═════════════════════════════════════════════════════════════════════════════
+if page == "🏗️ Build Rules":
+    st.markdown("## 🏗️ Build a New Rule")
+
+    tmpl_name = st.selectbox("**Rule Type**", list(TEMPLATES.keys()),
+                             format_func=lambda x: f"{x} — {TEMPLATES[x]['desc']}")
+    tmpl = TEMPLATES[tmpl_name]
+    st.divider()
+
+    # Metadata
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        rule_name = st.text_input("📌 Rule Name", placeholder="e.g. Orders daily freshness")
+    with c2:
+        severity = st.selectbox("⚠️ Severity", ["critical", "warning", "info"])
+    with c3:
+        owner = st.text_input("👤 Owner", placeholder="data-eng")
+    with c4:
+        category = st.text_input("📁 Category", placeholder="sales")
+
+    st.divider()
+
+    # Table & Columns
+    selected_table = ""
+    columns = []
+    available_tables = []
+    if "custom_sql" not in tmpl["fields"]:
+        selected_catalog = st.selectbox(
+            "**🗂️ Select Catalog**",
+            [""] + st.session_state.catalogs,
+            format_func=lambda x: "— Pick a catalog —" if not x else x,
+        )
+
+        schema_options = []
+        selected_schema = ""
+        if selected_catalog:
+            with st.spinner("Loading schemas..."):
+                schema_options = get_schemas_for_catalog(selected_catalog)
+            selected_schema = st.selectbox(
+                "**🧩 Select Schema**",
+                [""] + schema_options,
+                format_func=lambda x: "— Pick a schema —" if not x else x,
+            )
+
+        if selected_catalog and selected_schema:
+            with st.spinner("Loading tables..."):
+                available_tables = get_tables_for_scope(selected_catalog, selected_schema)
+            st.session_state.tables = available_tables
+
+        selected_table = st.selectbox(
+            "**🗄️ Select Table**", [""] + available_tables,
+            format_func=lambda x: "— Pick a table (type to search) —" if not x else x,
+        )
+        if selected_table:
+            with st.spinner(f"Loading columns..."):
+                columns = get_cols(selected_table)
+            if columns:
+                st.caption(f"{len(columns)} columns found")
+
+            with st.expander("👀 Sample Data (2 rows)", expanded=False):
+                s_cols, s_rows, s_err = get_table_sample(selected_table, limit=2)
+                if s_err:
+                    st.warning(f"Could not load sample rows: {s_err}")
+                elif not s_rows:
+                    st.info("No records found in this table.")
+                else:
+                    preview_rows = [dict(zip(s_cols, r)) for r in s_rows]
+                    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+
+    # Dynamic fields
+    fv = {}
+    if columns or "custom_sql" in tmpl["fields"]:
+        col_disp = [f"{c['name']}  ({c['type']})" for c in columns]
+        col_names = [c["name"] for c in columns]
+        f1, f2 = st.columns(2)
+
+        for i, field in enumerate(tmpl["fields"]):
+            t = f1 if i % 2 == 0 else f2
+            if field in ("date_column", "target_column"):
+                label = "📅 Date Column" if field == "date_column" else "🎯 Target Column"
+                with t:
+                    idx = st.selectbox(label, range(len(col_disp)),
+                                       format_func=lambda i: col_disp[i], key=field)
+                    fv[field] = col_names[idx]
+            elif field == "interval_days":
+                with t:
+                    fv[field] = str(st.number_input("📆 Max Days Old", min_value=1, value=1))
+            elif field == "min_rows":
+                with t:
+                    fv[field] = str(st.number_input("🔢 Min Rows", min_value=0, value=0))
+            elif field == "min_val":
+                with t:
+                    fv[field] = str(st.number_input("⬇️ Min", value=0))
+            elif field == "max_val":
+                with t:
+                    fv[field] = str(st.number_input("⬆️ Max", value=100))
+            elif field == "allowed_values":
+                fv[field] = st.text_input("📋 Allowed Values (comma-separated)",
+                                          placeholder="pending, shipped, delivered")
+            elif field == "parent_table":
+                with t:
+                    parent_catalog = st.selectbox(
+                        "🗂️ Parent Catalog",
+                        [""] + st.session_state.catalogs,
+                        format_func=lambda x: "— Pick catalog —" if not x else x,
+                        key="p_cat",
+                    )
+                    parent_schemas = []
+                    parent_schema = ""
+                    if parent_catalog:
+                        with st.spinner("Loading parent schemas..."):
+                            parent_schemas = get_schemas_for_catalog(parent_catalog)
+                        parent_schema = st.selectbox(
+                            "🧩 Parent Schema",
+                            [""] + parent_schemas,
+                            format_func=lambda x: "— Pick schema —" if not x else x,
+                            key="p_sch",
+                        )
+
+                    parent_tables = []
+                    if parent_catalog and parent_schema:
+                        with st.spinner("Loading parent tables..."):
+                            parent_tables = get_tables_for_scope(parent_catalog, parent_schema)
+
+                    fv[field] = st.selectbox(
+                        "🗄️ Parent Table",
+                        [""] + parent_tables,
+                        format_func=lambda x: "— Select —" if not x else x,
+                        key="ptbl",
+                    )
+            elif field == "parent_column":
+                pt = fv.get("parent_table", "")
+                with t:
+                    if pt:
+                        pc = get_cols(pt)
+                        pc_d = [f"{c['name']} ({c['type']})" for c in pc]
+                        pc_n = [c["name"] for c in pc]
+                        if pc:
+                            pi = st.selectbox("🔑 Parent Column", range(len(pc_d)),
+                                              format_func=lambda i: pc_d[i], key="pcol")
+                            fv[field] = pc_n[pi]
+                        else:
+                            fv[field] = st.text_input("🔑 Parent Column", placeholder="id")
+                    else:
+                        fv[field] = st.text_input("🔑 Parent Column", placeholder="id")
+            elif field == "custom_sql":
+                fv[field] = st.text_area("✏️ SQL (must return TRUE/FALSE)",
+                                         placeholder="SELECT COUNT(*) = 0 FROM ...", height=120)
+
+    # Build SQL
+    gen_sql = ""
+    try:
+        args = [selected_table] + [fv.get(f, "") for f in tmpl["fields"]]
+        if tmpl["fields"] == ["custom_sql"]:
+            args = [selected_table, fv.get("custom_sql", "")]
+        gen_sql = tmpl["sql"](*args)
+    except Exception:
+        pass
+
+    if gen_sql:
+        st.markdown("---")
+        st.markdown("**Generated SQL:**")
+        st.markdown(f'<div class="sql-box">{gen_sql}</div>', unsafe_allow_html=True)
+
+    can_go = bool(gen_sql) and (bool(selected_table) or "custom_sql" in tmpl["fields"])
+    st.markdown("---")
+    a1, a2, a3 = st.columns(3)
+
+    with a1:
+        if st.button("🧪 Test Rule", disabled=not can_go, use_container_width=True):
+            with st.spinner("Executing..."):
+                passed, elapsed, err = test_rule(gen_sql)
+            if err:
+                st.markdown(f'<div class="card-fail">❌ ERROR ({elapsed}s): {err}</div>', unsafe_allow_html=True)
+            elif passed:
+                st.markdown(f'<div class="card-pass">✅ PASSED in {elapsed}s</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="card-fail">❌ FAILED in {elapsed}s</div>', unsafe_allow_html=True)
+
+    with a2:
+        if st.button("➕ Add to Queue", disabled=not can_go, use_container_width=True):
+            rid = f"R{len(st.session_state.rule_queue) + 1:03d}"
+            st.session_state.rule_queue.append({
+                "rule_id": rid, "dataset": selected_table or "",
+                "rule_name": rule_name or tmpl_name.split(" ", 1)[1],
+                "rule_type": tmpl["key"], "rule_sql": gen_sql,
+                "severity": severity, "owner": owner, "category": category,
+                "created_by": "streamlit",
+            })
+            st.toast(f"✅ {rid} queued")
+            st.rerun()
+
+    with a3:
+        if st.button("🚀 Push Now", disabled=not can_go, type="primary", use_container_width=True):
+            rid = f"R_{uuid.uuid4().hex[:6].upper()}"
+            rule = {
+                "rule_id": rid, "dataset": selected_table or "",
+                "rule_name": rule_name or tmpl_name.split(" ", 1)[1],
+                "rule_type": tmpl["key"], "rule_sql": gen_sql,
+                "severity": severity, "owner": owner, "category": category,
+                "created_by": "streamlit",
+            }
+            with st.spinner("Pushing..."):
+                ok, err = push_rule(rule)
+            if ok:
+                st.toast(f"✅ {rid} pushed!")
+                st.balloons()
+            else:
+                st.error(f"Failed: {err}")
+
+    # Show queue
+    if st.session_state.rule_queue:
+        st.markdown("---")
+        st.markdown(f"### 📝 Queue ({len(st.session_state.rule_queue)})")
+        for r in st.session_state.rule_queue:
+            sev = f'<span class="sev-{r["severity"]}">{r["severity"]}</span>'
+            st.markdown(
+                f'<div class="card"><span class="tag">{r["rule_id"]}</span> {sev} '
+                f'<b style="color:#e2e8f0;">{r["rule_name"]}</b><br>'
+                f'<span style="color:#64748b;font-size:12px;">{r["dataset"]} · {r["rule_type"]}</span>'
+                f'<div class="sql-box" style="font-size:11px;margin-top:6px;">'
+                f'{r["rule_sql"][:200]}</div></div>', unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: MANAGE RULES
+# ═════════════════════════════════════════════════════════════════════════════
+elif page == "📋 Manage Rules":
+    st.markdown("## 📋 Manage Existing Rules")
+    try:
+        _, rows = get_all_rules()
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        st.stop()
+
+    if not rows:
+        st.info("No rules found. Go to **Build Rules** to create your first rule.")
+        st.stop()
+
+    total = len(rows)
+    active = sum(1 for r in rows if r[8])
+    crit = sum(1 for r in rows if r[5] == "critical" and r[8])
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#60a5fa;">{total}</div><div class="stat-label">Total</div></div>', unsafe_allow_html=True)
+    with s2:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#22c55e;">{active}</div><div class="stat-label">Active</div></div>', unsafe_allow_html=True)
+    with s3:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#ef4444;">{crit}</div><div class="stat-label">Critical</div></div>', unsafe_allow_html=True)
+
+    st.divider()
+    filt = st.text_input("🔍 Search rules", placeholder="Filter by name, table, ID...")
+
+    for row in rows:
+        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
+        if filt and filt.lower() not in " ".join(str(x) for x in [rid, ds, rname, rtype, own, cat]).lower():
+            continue
+
+        dot = "🟢" if is_active else "⚪"
+        sev_h = f'<span class="sev-{sev}">{sev}</span>'
+        last_icon = "✅" if last_ok else ("❌" if last_ok is False else "—")
+
+        st.markdown(
+            f'<div class="card">{dot} <span class="tag">{rid}</span> {sev_h} '
+            f'<span style="color:#64748b;font-size:12px;">{rtype} · {cat or ""}</span> '
+            f'<span style="float:right;">{last_icon}</span><br>'
+            f'<b style="color:#f1f5f9;font-size:15px;">{rname}</b><br>'
+            f'<span style="color:#64748b;font-size:12px;">{ds} · Owner: {own or "—"}</span>'
+            f'<div class="sql-box" style="font-size:11px;margin-top:6px;">{rsql}</div></div>',
+            unsafe_allow_html=True)
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("🧪 Test", key=f"t_{rid}", use_container_width=True):
+                with st.spinner("Testing..."):
+                    ok, el, err = test_rule(rsql)
+                if err:
+                    st.error(f"Error ({el}s): {err}")
+                elif ok:
+                    st.success(f"✅ Passed ({el}s)")
+                else:
+                    st.error(f"❌ Failed ({el}s)")
+        with b2:
+            lbl = "⏸️ Disable" if is_active else "▶️ Enable"
+            if st.button(lbl, key=f"tog_{rid}", use_container_width=True):
+                toggle_rule(rid, not is_active)
+                st.rerun()
+        with b3:
+            if st.button("🗑️ Delete", key=f"del_{rid}", use_container_width=True):
+                delete_rule(rid)
+                st.toast(f"Deleted {rid}")
+                st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: RUN HISTORY
+# ═════════════════════════════════════════════════════════════════════════════
+elif page == "📊 Run History":
+    st.markdown("## 📊 Validation Run History")
+    try:
+        _, rows = get_latest_run()
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        st.stop()
+
+    if not rows:
+        st.info("No runs yet. Schedule the validation runner notebook.")
+        st.stop()
+
+    passed_n = sum(1 for r in rows if r[4])
+    failed_n = sum(1 for r in rows if not r[4])
+    total_t = sum(r[6] or 0 for r in rows)
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#22c55e;">{passed_n}</div><div class="stat-label">Passed</div></div>', unsafe_allow_html=True)
+    with m2:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#ef4444;">{failed_n}</div><div class="stat-label">Failed</div></div>', unsafe_allow_html=True)
+    with m3:
+        st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#60a5fa;">{total_t:.1f}s</div><div class="stat-label">Runtime</div></div>', unsafe_allow_html=True)
+
+    st.divider()
+    for row in rows:
+        rid, ds, rname, sev, ok, err, dur, ts, runid = row
+        icon = "✅" if ok else "❌"
+        cls = "card-pass" if ok else "card-fail"
+        sev_h = f'<span class="sev-{sev}">{sev}</span>'
+        st.markdown(
+            f'<div class="{cls}">{icon} <span class="tag">{rid}</span> {sev_h} '
+            f'<b style="color:#e2e8f0;">{rname}</b>'
+            f'<span style="float:right;color:#64748b;font-size:12px;">{dur or 0:.1f}s</span><br>'
+            f'<span style="color:#64748b;font-size:12px;">{ds}{(" · " + str(err)) if err and not ok else ""}</span></div>',
+            unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("### 📈 30-Day Trend")
+    try:
+        _, trend = get_daily_trend()
+        if trend:
+            import pandas as pd
+            df = pd.DataFrame(trend, columns=["Date", "Critical", "Warnings", "Passed"])
+            df["Date"] = pd.to_datetime(df["Date"])
+            st.area_chart(df.set_index("Date"), color=["#ef4444", "#f59e0b", "#22c55e"])
+    except Exception:
+        st.info("Not enough data yet.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: AUDIT LOG
+# ═════════════════════════════════════════════════════════════════════════════
+elif page == "📝 Audit Log":
+    st.markdown("## 📝 Rule Change Audit Log")
+    try:
+        _, rows = get_audit_log(100)
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        st.stop()
+
+    if not rows:
+        st.info("No audit entries yet. Changes will appear here as you create, edit, and delete rules.")
+        st.stop()
+
+    import pandas as pd
+    df = pd.DataFrame(rows, columns=["Audit ID", "Rule ID", "Action", "Field", "Old", "New", "By", "At"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
