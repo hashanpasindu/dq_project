@@ -95,7 +95,11 @@ def get_schemas_for_catalog(catalog_name):
     if catalog_name not in st.session_state.schema_cache:
         cfg = st.session_state.dbx_config
         st.session_state.schema_cache[catalog_name] = discover_schemas(
-            cfg["hostname"], cfg["http_path"], cfg["token"], catalog_name
+            cfg["hostname"],
+            cfg["http_path"],
+            cfg["token"],
+            catalog_name,
+            cfg.get("tls_ca_file", ""),
         )
     return st.session_state.schema_cache.get(catalog_name, [])
 
@@ -107,7 +111,12 @@ def get_tables_for_scope(catalog_name, schema_name):
     if cache_key not in st.session_state.table_cache:
         cfg = st.session_state.dbx_config
         st.session_state.table_cache[cache_key] = discover_tables_in_schema(
-            cfg["hostname"], cfg["http_path"], cfg["token"], catalog_name, schema_name
+            cfg["hostname"],
+            cfg["http_path"],
+            cfg["token"],
+            catalog_name,
+            schema_name,
+            cfg.get("tls_ca_file", ""),
         )
     return st.session_state.table_cache.get(cache_key, [])
 
@@ -127,6 +136,11 @@ with st.sidebar:
                               placeholder="/sql/1.0/warehouses/xxx")
     dq_catalog = st.text_input("DQ Catalog", value=saved.get("dq_catalog", ""),
                                placeholder="hive_metastore")
+    tls_ca_file = st.text_input(
+        "Trusted CA file path (optional)",
+        value=saved.get("tls_ca_file", ""),
+        placeholder="/path/to/corporate-root-ca.pem",
+    )
     token = st.text_input("PAT Token", value=saved.get("token", ""),
                           type="password", placeholder="dapi...")
     remember = st.checkbox("Remember connection", value=bool(saved))
@@ -135,6 +149,8 @@ with st.sidebar:
         st.success(f"Connected · {len(st.session_state.catalogs)} catalogs")
         current_dq_catalog = st.session_state.dbx_config.get("dq_catalog", "")
         st.caption(f"Rules Catalog: {current_dq_catalog}")
+        if st.session_state.dbx_config.get("tls_ca_file"):
+            st.caption(f"TLS CA: {st.session_state.dbx_config.get('tls_ca_file')}")
 
         if dq_catalog.strip() and dq_catalog.strip() != current_dq_catalog:
             if st.button("🧭 Apply Rules Catalog", use_container_width=True):
@@ -161,7 +177,12 @@ with st.sidebar:
                 st.session_state.tables = []
                 cfg = st.session_state.dbx_config
                 with st.spinner("Refreshing..."):
-                    st.session_state.catalogs = discover_catalogs(cfg["hostname"], cfg["http_path"], cfg["token"])
+                    st.session_state.catalogs = discover_catalogs(
+                        cfg["hostname"],
+                        cfg["http_path"],
+                        cfg["token"],
+                        cfg.get("tls_ca_file", ""),
+                    )
                 st.rerun()
         with c2:
             if st.button("🔌 Disconnect", use_container_width=True):
@@ -179,7 +200,12 @@ with st.sidebar:
                 st.error("DQ Catalog is required")
             else:
                 with st.spinner("Connecting..."):
-                    ok, msg = test_connection(hostname, http_path, token)
+                    ok, msg = test_connection(
+                        hostname,
+                        http_path,
+                        token,
+                        tls_ca_file=tls_ca_file,
+                    )
                 if not ok:
                     st.error(f"Failed: {msg}")
                 else:
@@ -188,10 +214,16 @@ with st.sidebar:
                         "http_path": http_path,
                         "token": token,
                         "dq_catalog": dq_catalog.strip(),
+                        "tls_ca_file": tls_ca_file.strip(),
                     }
                     st.session_state.dbx_config = cfg
                     with st.spinner("Loading catalogs & creating DQ schema..."):
-                        st.session_state.catalogs = discover_catalogs(hostname, http_path, token)
+                        st.session_state.catalogs = discover_catalogs(
+                            hostname,
+                            http_path,
+                            token,
+                            tls_ca_file=tls_ca_file,
+                        )
                         st.session_state.tables = []
                         st.session_state.schema_cache = {}
                         st.session_state.table_cache = {}
@@ -292,9 +324,12 @@ if page == "🏗️ Build Rules":
     columns = []
     available_tables = []
     if "custom_sql" not in tmpl["fields"]:
+        dev_catalogs = [c for c in st.session_state.catalogs if "dev" in c.lower()]
+        if not dev_catalogs:
+            st.warning("No catalogs with 'dev' in the name are available for rule creation.")
         selected_catalog = st.selectbox(
             "**🗂️ Select Catalog**",
-            [""] + st.session_state.catalogs,
+            [""] + dev_catalogs,
             format_func=lambda x: "— Pick a catalog —" if not x else x,
         )
 
@@ -507,17 +542,19 @@ elif page == "📋 Manage Rules":
     st.markdown("### 🚚 Promote Rules: Dev → Test → Prod")
     st.caption("Search rules by table name, pick the rules to promote, then replace the data catalog inside dataset and rule SQL.")
 
-    promote_filter = st.text_input(
-        "🔎 Search Table Name For Promotion",
-        placeholder="orders, customers, invoice_lines...",
+    promote_table_options = sorted({str(row[1] or "") for row in rows if row[1]})
+    selected_promote_table = st.selectbox(
+        "🔎 Promotion Table Filter",
+        ["All tables"] + promote_table_options,
+        help="Type to search table names",
         key="promote_table_search",
-    ).strip().lower()
+    )
 
     promote_candidates = []
     for row in rows:
         rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
-        haystack = " ".join(str(x or "") for x in [ds, rname, rsql]).lower()
-        if promote_filter and promote_filter not in haystack:
+        dataset = str(ds or "")
+        if selected_promote_table != "All tables" and dataset != selected_promote_table:
             continue
         promote_candidates.append((rid, ds, rname))
 
@@ -537,11 +574,43 @@ elif page == "📋 Manage Rules":
         placeholder="Choose one or more rules",
     )
 
+    promote_catalog_options = sorted(set(st.session_state.catalogs))
+
+    def promotion_env_key(catalog_name: str) -> str:
+        c = (catalog_name or "").lower()
+        if "prod" in c:
+            return "prod"
+        if "uat" in c or "test" in c:
+            return "test"
+        if "dev" in c:
+            return "dev"
+        return "unknown"
+
     p1, p2 = st.columns(2)
     with p1:
-        source_catalog = st.text_input("Source Data Catalog", placeholder="dev_catalog", key="promote_src")
+        source_catalog = st.selectbox(
+            "Source Data Catalog",
+            [""] + promote_catalog_options,
+            key="promote_src",
+            format_func=lambda x: "— Select source catalog —" if not x else x,
+            help="Type to search catalogs",
+        )
     with p2:
-        target_catalog = st.text_input("Target Data Catalog", placeholder="test_catalog", key="promote_tgt")
+        source_env = promotion_env_key(source_catalog)
+        if source_env == "dev":
+            allowed_targets = [c for c in promote_catalog_options if promotion_env_key(c) == "test"]
+        elif source_env == "test":
+            allowed_targets = [c for c in promote_catalog_options if promotion_env_key(c) == "prod"]
+        else:
+            allowed_targets = []
+
+        target_catalog = st.selectbox(
+            "Target Data Catalog",
+            [""] + allowed_targets,
+            key="promote_tgt",
+            format_func=lambda x: "— Select target catalog —" if not x else x,
+            help="Allowed: dev -> test/uat, test/uat -> prod",
+        )
 
     selected_rule_ids = [promote_option_to_id[x] for x in selected_promotion_options]
 
@@ -568,20 +637,29 @@ elif page == "📋 Manage Rules":
             st.warning("The selected rules do not currently contain the source catalog. For a dev to test promotion, source should be the current catalog in the rule and target should be the new catalog.")
 
     if st.button("🔁 Remap Catalog In Selected Rules", type="primary", use_container_width=True):
-        checked, updated, errs = remap_rule_catalog_references(
-            source_catalog,
-            target_catalog,
-            rule_ids=selected_rule_ids,
-        )
-        if errs:
-            st.warning(f"Checked {checked} rules · Updated {updated} · Errors {len(errs)}")
-            with st.expander("Show remap errors"):
-                for e in errs:
-                    st.code(e)
-        elif checked > 0 and updated == 0:
-            st.warning("Checked selected rules, but none contained the source catalog to replace. Verify source and target order.")
+        src_env = promotion_env_key(source_catalog)
+        tgt_env = promotion_env_key(target_catalog)
+        allowed_transition = (src_env == "dev" and tgt_env == "test") or (src_env == "test" and tgt_env == "prod")
+
+        if not source_catalog or not target_catalog:
+            st.warning("Select both source and target catalogs before promotion.")
+        elif not allowed_transition:
+            st.warning("Only these promotions are allowed: dev -> uat/test, uat/test -> prod.")
         else:
-            st.success(f"Checked {checked} rules · Updated {updated}")
+            checked, updated, errs = remap_rule_catalog_references(
+                source_catalog,
+                target_catalog,
+                rule_ids=selected_rule_ids,
+            )
+            if errs:
+                st.warning(f"Checked {checked} rules · Updated {updated} · Errors {len(errs)}")
+                with st.expander("Show remap errors"):
+                    for e in errs:
+                        st.code(e)
+            elif checked > 0 and updated == 0:
+                st.warning("Checked selected rules, but none contained the source catalog to replace. Verify source and target order.")
+            else:
+                st.success(f"Checked {checked} rules · Updated {updated}")
 
     if not promote_candidates:
         st.info("No rules matched the table-name search for promotion.")
@@ -601,11 +679,21 @@ elif page == "📋 Manage Rules":
         st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#ef4444;">{crit}</div><div class="stat-label">Critical</div></div>', unsafe_allow_html=True)
 
     st.divider()
-    filt = st.text_input("🔍 Search rules", placeholder="Filter by name, table, ID...")
+
+    rule_search_options = [
+        f"{r[0]} | {r[2]} | {r[1]} | {r[3]}"
+        for r in rows
+    ]
+    selected_rule_search = st.multiselect(
+        "🔍 Search rules",
+        options=rule_search_options,
+        placeholder="Type to search and select rules",
+    )
+    selected_rule_ids_for_view = {opt.split(" | ", 1)[0] for opt in selected_rule_search}
 
     for row in rows:
         rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
-        if filt and filt.lower() not in " ".join(str(x) for x in [rid, ds, rname, rtype, own, cat]).lower():
+        if selected_rule_ids_for_view and rid not in selected_rule_ids_for_view:
             continue
 
         dot = "🟢" if is_active else "⚪"

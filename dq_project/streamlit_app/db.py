@@ -10,15 +10,69 @@ import streamlit as st
 from databricks import sql as dbx_sql
 
 
+# Connector defaults are generous (up to ~15 min retry windows). Keep these
+# short so the UI fails fast with actionable errors when a warehouse is down.
+DBX_SOCKET_TIMEOUT_SEC = 25
+DBX_RETRY_ATTEMPTS = 3
+DBX_RETRY_MAX_DURATION_SEC = 45
+DQ_BACKEND_CATALOG = "data_quality"
+
+
+def _normalize_hostname(hostname: str) -> str:
+    val = (hostname or "").strip()
+    if val.startswith("https://"):
+        val = val[len("https://") :]
+    elif val.startswith("http://"):
+        val = val[len("http://") :]
+    return val.rstrip("/")
+
+
+def _normalize_http_path(http_path: str) -> str:
+    val = (http_path or "").strip()
+    if not val:
+        return val
+    if not val.startswith("/"):
+        val = f"/{val}"
+    return val
+
+
+def _build_tls_kwargs(tls_ca_file: str | None = None) -> dict:
+    kwargs = {}
+    ca_file = (tls_ca_file or "").strip()
+    if ca_file:
+        kwargs["_tls_trusted_ca_file"] = ca_file
+    return kwargs
+
+
+def _dbx_connect(
+    hostname: str,
+    http_path: str,
+    token: str,
+    tls_ca_file: str | None = None,
+):
+    return dbx_sql.connect(
+        server_hostname=_normalize_hostname(hostname),
+        http_path=_normalize_http_path(http_path),
+        access_token=(token or "").strip(),
+        _socket_timeout=DBX_SOCKET_TIMEOUT_SEC,
+        _retry_stop_after_attempts_count=DBX_RETRY_ATTEMPTS,
+        _retry_stop_after_attempts_duration=DBX_RETRY_MAX_DURATION_SEC,
+        _retry_delay_min=1,
+        _retry_delay_max=5,
+        **_build_tls_kwargs(tls_ca_file=tls_ca_file),
+    )
+
+
 # ─── Connection ──────────────────────────────────────────────────────────────
 
 def get_connection():
     """Create a fresh connection from session state config."""
     cfg = st.session_state["dbx_config"]
-    return dbx_sql.connect(
-        server_hostname=cfg["hostname"],
-        http_path=cfg["http_path"],
-        access_token=cfg["token"],
+    return _dbx_connect(
+        cfg["hostname"],
+        cfg["http_path"],
+        cfg["token"],
+        tls_ca_file=cfg.get("tls_ca_file", ""),
     )
 
 
@@ -35,30 +89,64 @@ def run_sql(sql: str, fetch: bool = True):
         conn.close()
 
 
-def test_connection(hostname, http_path, token) -> tuple[bool, str]:
+def test_connection(
+    hostname,
+    http_path,
+    token,
+    tls_ca_file: str | None = None,
+) -> tuple[bool, str]:
     """Test connectivity. Returns (success, message)."""
+    host = _normalize_hostname(hostname)
+    path = _normalize_http_path(http_path)
+    tok = (token or "").strip()
+
+    if not all([host, path, tok]):
+        return False, "Missing hostname, HTTP path, or token"
+
     try:
-        conn = dbx_sql.connect(
-            server_hostname=hostname, http_path=http_path, access_token=token
+        conn = _dbx_connect(
+            host,
+            path,
+            tok,
+            tls_ca_file=tls_ca_file,
         )
         cur = conn.cursor()
         cur.execute("SELECT 1")
+        cur.fetchall()
         conn.close()
         return True, "Connected successfully"
     except Exception as e:
-        return False, str(e)
+        msg = str(e)
+        if "401" in msg or "403" in msg or "invalid access token" in msg.lower():
+            return False, "Authentication failed. Check PAT token and SQL Warehouse permissions."
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            return False, "Connection timed out. Verify warehouse is running and network allows Databricks SQL endpoint."
+        if "certificate_verify_failed" in msg.lower() or "self-signed certificate" in msg.lower():
+            return False, "SSL certificate verification failed. Add your corporate/root CA PEM path in 'Trusted CA file path'."
+        if "not found" in msg.lower() and "warehouse" in msg.lower():
+            return False, "SQL Warehouse not found. Verify the HTTP path for this workspace."
+        return False, msg
 
 
 def get_dq_catalog() -> str:
-    """Return configured catalog for DQ backend tables."""
+    """Return configured data catalog used for env detection in UI."""
     cfg = st.session_state.get("dbx_config", {})
     return cfg.get("dq_catalog", "hive_metastore")
 
 
+def env_schema_name(env_key: str) -> str:
+    env = (env_key or "dev").lower()
+    if env == "prod":
+        return "prod_rules"
+    if env in ("test", "uat"):
+        return "test_rules"
+    return "dev_rules"
+
+
 def dq_schema_fqn(catalog: str | None = None) -> str:
-    """Return fully qualified data_quality schema path."""
-    cat = catalog or get_dq_catalog()
-    return f"`{cat}`.`data_quality`"
+    """Return fully qualified DQ schema path in fixed data_quality catalog."""
+    env = detect_env(catalog)
+    return f"`{DQ_BACKEND_CATALOG}`.`{env_schema_name(env)}`"
 
 
 def detect_env(catalog: str | None = None) -> str:
@@ -67,20 +155,20 @@ def detect_env(catalog: str | None = None) -> str:
     if "prod" in cat:
         return "prod"
     if "uat" in cat or "test" in cat:
-        return "uat"
+        return "test"
     if "dev" in cat:
         return "dev"
     return "dev"
 
 
-def dq_table_name(base_name: str, catalog: str | None = None) -> str:
-    """Return environment-scoped table name (e.g. rules_dev)."""
-    return f"{base_name}_{detect_env(catalog)}"
-
-
 def dq_table(name: str, catalog: str | None = None) -> str:
     """Return fully qualified DQ table path."""
-    return f"{dq_schema_fqn(catalog)}.`{dq_table_name(name, catalog)}`"
+    return f"{dq_schema_fqn(catalog)}.`{name}`"
+
+
+def dq_table_for_env(name: str, env_key: str) -> str:
+    """Return fully qualified DQ table path for an explicit environment."""
+    return f"`{DQ_BACKEND_CATALOG}`.`{env_schema_name(env_key)}`.`{name}`"
 
 
 def ensure_results_table_shape(catalog: str | None = None) -> tuple[bool, list[str]]:
@@ -121,10 +209,18 @@ def ensure_results_table_shape(catalog: str | None = None) -> tuple[bool, list[s
 
 # ─── Discovery ───────────────────────────────────────────────────────────────
 
-def discover_catalogs(hostname, http_path, token) -> list[str]:
+def discover_catalogs(
+    hostname,
+    http_path,
+    token,
+    tls_ca_file: str | None = None,
+) -> list[str]:
     """Return all accessible Unity Catalog catalogs."""
-    conn = dbx_sql.connect(
-        server_hostname=hostname, http_path=http_path, access_token=token
+    conn = _dbx_connect(
+        hostname,
+        http_path,
+        token,
+        tls_ca_file=tls_ca_file,
     )
     try:
         cur = conn.cursor()
@@ -137,10 +233,19 @@ def discover_catalogs(hostname, http_path, token) -> list[str]:
         conn.close()
 
 
-def discover_schemas(hostname, http_path, token, catalog: str) -> list[str]:
+def discover_schemas(
+    hostname,
+    http_path,
+    token,
+    catalog: str,
+    tls_ca_file: str | None = None,
+) -> list[str]:
     """Return all accessible schemas in a catalog."""
-    conn = dbx_sql.connect(
-        server_hostname=hostname, http_path=http_path, access_token=token
+    conn = _dbx_connect(
+        hostname,
+        http_path,
+        token,
+        tls_ca_file=tls_ca_file,
     )
     try:
         cur = conn.cursor()
@@ -153,10 +258,20 @@ def discover_schemas(hostname, http_path, token, catalog: str) -> list[str]:
         conn.close()
 
 
-def discover_tables_in_schema(hostname, http_path, token, catalog: str, schema: str) -> list[str]:
+def discover_tables_in_schema(
+    hostname,
+    http_path,
+    token,
+    catalog: str,
+    schema: str,
+    tls_ca_file: str | None = None,
+) -> list[str]:
     """Return all tables in a single catalog.schema as fully qualified names."""
-    conn = dbx_sql.connect(
-        server_hostname=hostname, http_path=http_path, access_token=token
+    conn = _dbx_connect(
+        hostname,
+        http_path,
+        token,
+        tls_ca_file=tls_ca_file,
     )
     try:
         cur = conn.cursor()
@@ -170,10 +285,18 @@ def discover_tables_in_schema(hostname, http_path, token, catalog: str, schema: 
         conn.close()
 
 
-def discover_tables(hostname, http_path, token) -> list[str]:
+def discover_tables(
+    hostname,
+    http_path,
+    token,
+    tls_ca_file: str | None = None,
+) -> list[str]:
     """Walk Unity Catalog and return all accessible tables."""
-    conn = dbx_sql.connect(
-        server_hostname=hostname, http_path=http_path, access_token=token
+    conn = _dbx_connect(
+        hostname,
+        http_path,
+        token,
+        tls_ca_file=tls_ca_file,
     )
     tables = []
     try:
@@ -229,16 +352,13 @@ def get_table_sample(table_name: str, limit: int = 2) -> tuple[list[str], list[t
 # ─── Schema Bootstrap ────────────────────────────────────────────────────────
 
 def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
-    """Create all backend tables if they don't exist."""
-    schema = dq_schema_fqn(catalog)
-    rules_tbl = dq_table_name("rules", catalog)
-    results_tbl = dq_table_name("results", catalog)
-    audit_tbl = dq_table_name("rule_audit", catalog)
-    alert_cfg_tbl = dq_table_name("alert_config", catalog)
-    alert_log_tbl = dq_table_name("alert_log", catalog)
-    ddls = [
+    """Create backend catalog/schemas/tables for dev, test, and prod rules."""
+    ddls = [f"CREATE CATALOG IF NOT EXISTS `{DQ_BACKEND_CATALOG}`"]
+    for env_key in ("dev", "test", "prod"):
+        schema = f"`{DQ_BACKEND_CATALOG}`.`{env_schema_name(env_key)}`"
+        ddls.extend([
         f"CREATE SCHEMA IF NOT EXISTS {schema}",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`{rules_tbl}` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`rules` (
             rule_id STRING NOT NULL, rule_name STRING NOT NULL,
             dataset STRING NOT NULL, rule_type STRING NOT NULL,
             rule_sql STRING NOT NULL, severity STRING NOT NULL,
@@ -249,7 +369,7 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             created_by STRING, created_at TIMESTAMP DEFAULT current_timestamp(),
             updated_by STRING, updated_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`{results_tbl}` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`results` (
             run_id STRING NOT NULL, run_type STRING DEFAULT 'scheduled',
             rule_id STRING NOT NULL, dataset STRING NOT NULL,
             rule_name STRING NOT NULL, rule_type STRING NOT NULL,
@@ -257,13 +377,13 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             error_message STRING, result_value STRING,
             execution_time_sec DOUBLE, checked_at TIMESTAMP NOT NULL
         ) USING DELTA PARTITIONED BY (checked_at) TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`{audit_tbl}` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`rule_audit` (
             audit_id STRING NOT NULL, rule_id STRING NOT NULL,
             action STRING NOT NULL, field_changed STRING,
             old_value STRING, new_value STRING,
             changed_by STRING, changed_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`{alert_cfg_tbl}` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`alert_config` (
             config_id STRING NOT NULL, channel_type STRING NOT NULL,
             channel_name STRING NOT NULL, webhook_url STRING,
             smtp_server STRING, smtp_port INT, email_from STRING, email_to STRING,
@@ -272,14 +392,14 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             created_at TIMESTAMP DEFAULT current_timestamp(),
             updated_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-        f"""CREATE TABLE IF NOT EXISTS {schema}.`{alert_log_tbl}` (
+        f"""CREATE TABLE IF NOT EXISTS {schema}.`alert_log` (
             alert_id STRING NOT NULL, run_id STRING NOT NULL,
             config_id STRING NOT NULL, channel_type STRING NOT NULL,
             num_failures INT NOT NULL, num_critical INT, num_warnings INT,
             message_summary STRING, status STRING NOT NULL,
             error_message STRING, sent_at TIMESTAMP DEFAULT current_timestamp()
         ) USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')""",
-    ]
+        ])
     failures = []
     for ddl in ddls:
         try:
@@ -288,9 +408,10 @@ def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
             head = ddl.strip().splitlines()[0]
             failures.append(f"{head} -> {e}")
 
-    shape_ok, shape_failures = ensure_results_table_shape(catalog)
-    if not shape_ok:
-        failures.extend(shape_failures)
+    for env_key in ("dev", "test", "prod"):
+        shape_ok, shape_failures = ensure_results_table_shape(env_key)
+        if not shape_ok:
+            failures.extend(shape_failures)
 
     return len(failures) == 0, failures
 
@@ -453,8 +574,8 @@ def _replace_catalog_refs(text: str, old_catalog: str, new_catalog: str) -> str:
         return text
 
     old_esc = re.escape(old_catalog)
-    out = re.sub(rf"`{old_esc}`\\.", f"`{new_catalog}`.", text, flags=re.IGNORECASE)
-    out = re.sub(rf"(?<![A-Za-z0-9_]){old_esc}\\.", f"{new_catalog}.", out, flags=re.IGNORECASE)
+    out = re.sub(rf"`{old_esc}`\.", f"`{new_catalog}`.", text, flags=re.IGNORECASE)
+    out = re.sub(rf"(?<![A-Za-z0-9_]){old_esc}\.", f"{new_catalog}.", out, flags=re.IGNORECASE)
     return out
 
 
@@ -463,7 +584,7 @@ def remap_rule_catalog_references(
     new_catalog: str,
     rule_ids: list[str] | None = None,
 ) -> tuple[int, int, list[str]]:
-    """Update stored rules to point from one data catalog to another."""
+    """Promote selected rules from source env to target env and remap catalogs."""
     old_catalog = (old_catalog or "").strip()
     new_catalog = (new_catalog or "").strip()
     if not old_catalog or not new_catalog:
@@ -473,8 +594,16 @@ def remap_rule_catalog_references(
     if rule_ids is not None and not rule_ids:
         return 0, 0, ["Select at least one rule to promote"]
 
-    rules_tbl = dq_table("rules")
-    query = f"SELECT rule_id, dataset, rule_sql FROM {rules_tbl}"
+    source_env = detect_env(old_catalog)
+    target_env = detect_env(new_catalog)
+    source_rules_tbl = dq_table_for_env("rules", source_env)
+    target_rules_tbl = dq_table_for_env("rules", target_env)
+
+    query = (
+        "SELECT rule_id, rule_name, dataset, rule_type, rule_sql, severity, "
+        "category, owner, active, created_by "
+        f"FROM {source_rules_tbl}"
+    )
     if rule_ids is not None:
         esc = lambda s: (s or "").replace("\\", "\\\\").replace("'", "\\'")
         rule_id_list = ", ".join(f"'{esc(rule_id)}'" for rule_id in rule_ids)
@@ -486,7 +615,7 @@ def remap_rule_catalog_references(
     updated = 0
     errors = []
 
-    for rid, dataset, rule_sql in rows:
+    for rid, rule_name, dataset, rule_type, rule_sql, severity, category, owner, active, created_by in rows:
         new_dataset = _replace_catalog_refs(dataset or "", old_catalog, new_catalog)
         new_rule_sql = _replace_catalog_refs(rule_sql or "", old_catalog, new_catalog)
 
@@ -497,11 +626,39 @@ def remap_rule_catalog_references(
         try:
             run_sql(
                 f"""
-                UPDATE {rules_tbl}
-                SET dataset='{esc(new_dataset)}',
-                    rule_sql='{esc(new_rule_sql)}',
+                MERGE INTO {target_rules_tbl} AS t
+                USING (
+                    SELECT
+                        '{esc(rid)}' AS rule_id,
+                        '{esc(rule_name)}' AS rule_name,
+                        '{esc(new_dataset)}' AS dataset,
+                        '{esc(rule_type)}' AS rule_type,
+                        '{esc(new_rule_sql)}' AS rule_sql,
+                        '{esc(severity)}' AS severity,
+                        '{esc(category)}' AS category,
+                        '{esc(owner)}' AS owner,
+                        {str(bool(active)).lower()} AS active,
+                        '{esc(created_by or "streamlit")}' AS created_by
+                ) AS s
+                ON t.rule_id = s.rule_id
+                WHEN MATCHED THEN UPDATE SET
+                    rule_name=s.rule_name,
+                    dataset=s.dataset,
+                    rule_type=s.rule_type,
+                    rule_sql=s.rule_sql,
+                    severity=s.severity,
+                    category=s.category,
+                    owner=s.owner,
+                    active=s.active,
+                    updated_by='promotion',
                     updated_at=current_timestamp()
-                WHERE rule_id='{esc(rid)}'
+                WHEN NOT MATCHED THEN INSERT (
+                    rule_id, rule_name, dataset, rule_type, rule_sql, severity,
+                    category, owner, active, created_by, created_at, updated_by, updated_at
+                ) VALUES (
+                    s.rule_id, s.rule_name, s.dataset, s.rule_type, s.rule_sql, s.severity,
+                    s.category, s.owner, s.active, s.created_by, current_timestamp(), 'promotion', current_timestamp()
+                )
                 """,
                 fetch=False,
             )
@@ -509,8 +666,8 @@ def remap_rule_catalog_references(
                 rid,
                 "CATALOG_REMAP",
                 field_changed="dataset,rule_sql",
-                old_value=f"{old_catalog}",
-                new_value=f"{new_catalog}",
+                old_value=f"{old_catalog} ({source_env})",
+                new_value=f"{new_catalog} ({target_env})",
             )
             updated += 1
         except Exception as e:

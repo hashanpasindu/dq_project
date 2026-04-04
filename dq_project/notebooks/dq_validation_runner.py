@@ -23,33 +23,35 @@ from pyspark.sql import Row
 RUN_ID = str(uuid.uuid4())[:8]
 CHECKED_AT = datetime.now()
 
-dbutils.widgets.text("dq_catalog", "hive_metastore")
-DQ_CATALOG = dbutils.widgets.get("dq_catalog").strip() or "hive_metastore"
+dbutils.widgets.text("dq_backend_catalog", "data_quality")
+DQ_BACKEND_CATALOG = dbutils.widgets.get("dq_backend_catalog").strip() or "data_quality"
+dbutils.widgets.dropdown("dq_env", "dev", ["dev", "test", "prod"])
+DQ_ENV = dbutils.widgets.get("dq_env").strip().lower() or "dev"
 dbutils.widgets.text("pipeline_tables", "")
 PIPELINE_TABLES_RAW = dbutils.widgets.get("pipeline_tables").strip()
 
 
-def detect_env(catalog_name: str) -> str:
-    c = (catalog_name or "").lower()
-    if "prod" in c:
-        return "prod"
-    if "uat" in c or "test" in c:
-        return "uat"
-    if "dev" in c:
-        return "dev"
-    return "dev"
+if DQ_ENV not in ("dev", "test", "prod"):
+    raise ValueError("dq_env must be one of: dev, test, prod")
 
 
-ENV_KEY = detect_env(DQ_CATALOG)
-DQ_SCHEMA = f"`{DQ_CATALOG}`.`data_quality`"
-RULES_TBL = f"{DQ_SCHEMA}.`rules_{ENV_KEY}`"
-RESULTS_TBL = f"{DQ_SCHEMA}.`results_{ENV_KEY}`"
-AUDIT_TBL = f"{DQ_SCHEMA}.`rule_audit_{ENV_KEY}`"
-ALERT_CFG_TBL = f"{DQ_SCHEMA}.`alert_config_{ENV_KEY}`"
-ALERT_LOG_TBL = f"{DQ_SCHEMA}.`alert_log_{ENV_KEY}`"
+def env_schema(env_key: str) -> str:
+    if env_key == "prod":
+        return "prod_rules"
+    if env_key == "test":
+        return "test_rules"
+    return "dev_rules"
+
+
+DQ_SCHEMA = f"`{DQ_BACKEND_CATALOG}`.`{env_schema(DQ_ENV)}`"
+RULES_TBL = f"{DQ_SCHEMA}.`rules`"
+RESULTS_TBL = f"{DQ_SCHEMA}.`results`"
+AUDIT_TBL = f"{DQ_SCHEMA}.`rule_audit`"
+ALERT_CFG_TBL = f"{DQ_SCHEMA}.`alert_config`"
+ALERT_LOG_TBL = f"{DQ_SCHEMA}.`alert_log`"
 
 print(f"🚀 DQ Validation Run: {RUN_ID} at {CHECKED_AT}")
-print(f"📦 Catalog: {DQ_CATALOG} | Env: {ENV_KEY}")
+print(f"📦 DQ Backend Catalog: {DQ_BACKEND_CATALOG} | Env: {DQ_ENV}")
 
 
 def normalize_table_name(name: str) -> str:
@@ -146,7 +148,7 @@ for rule in rules:
 # Write all results
 if results:
     results_df = spark.createDataFrame(results)
-    results_df.write.mode("append").saveAsTable(f"{DQ_CATALOG}.data_quality.results_{ENV_KEY}")
+    results_df.write.mode("append").saveAsTable(f"{DQ_BACKEND_CATALOG}.{env_schema(DQ_ENV)}.results")
 else:
     print("ℹ️ No rules matched pipeline filter. Nothing to execute.")
 
