@@ -352,8 +352,23 @@ def get_table_sample(table_name: str, limit: int = 2) -> tuple[list[str], list[t
 # ─── Schema Bootstrap ────────────────────────────────────────────────────────
 
 def ensure_dq_schema(catalog: str | None = None) -> tuple[bool, list[str]]:
-    """Create backend catalog/schemas/tables for dev, test, and prod rules."""
-    ddls = [f"CREATE CATALOG IF NOT EXISTS `{DQ_BACKEND_CATALOG}`"]
+    """Create backend schemas/tables for dev, test, and prod rules."""
+    try:
+        _, cat_rows = run_sql("SHOW CATALOGS")
+        catalogs = {str(r[0]).strip().lower() for r in (cat_rows or []) if r and r[0]}
+    except Exception as e:
+        return False, [f"SHOW CATALOGS -> {e}"]
+
+    if DQ_BACKEND_CATALOG.lower() not in catalogs:
+        return False, [
+            (
+                f"Catalog `{DQ_BACKEND_CATALOG}` does not exist. "
+                "Create it in Databricks Catalog Explorer (UI) with Default Storage, "
+                "or create it with an explicit MANAGED LOCATION, then retry."
+            )
+        ]
+
+    ddls = []
     for env_key in ("dev", "test", "prod"):
         schema = f"`{DQ_BACKEND_CATALOG}`.`{env_schema_name(env_key)}`"
         ddls.extend([

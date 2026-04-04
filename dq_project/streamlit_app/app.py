@@ -7,6 +7,7 @@ streamlit run app.py
 import streamlit as st
 import uuid
 import time
+import re
 from config import load_config, save_config
 from db import (
     test_connection, discover_catalogs, discover_schemas, discover_tables_in_schema,
@@ -17,7 +18,12 @@ from db import (
 from templates import TEMPLATES
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="DQ Rule Builder", page_icon="🛡️", layout="wide")
+st.set_page_config(
+    page_title="DQ Rule Builder",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
@@ -26,7 +32,7 @@ st.markdown("""
         background: #0f1729; border-right: 1px solid #1c2940;
     }
     .block-container { padding-top: 1.5rem; }
-    #MainMenu, footer, header { visibility: hidden; }
+    #MainMenu, footer { visibility: hidden; }
 
     .sql-box {
         background: #030712; border: 1px solid #1e40af30;
@@ -119,6 +125,34 @@ def get_tables_for_scope(catalog_name, schema_name):
             cfg.get("tls_ca_file", ""),
         )
     return st.session_state.table_cache.get(cache_key, [])
+
+
+def validate_custom_sql(sql_text: str) -> tuple[bool, str | None]:
+    """Allow only read-only SQL queries for custom rules."""
+    text = (sql_text or "").strip()
+    if not text:
+        return False, "Custom SQL is required"
+
+    # Allow one optional trailing semicolon, but block multi-statement SQL.
+    normalized = text.rstrip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].rstrip()
+    if ";" in normalized:
+        return False, "Only a single SQL statement is allowed"
+
+    lower = normalized.lower()
+    if not (lower.startswith("select") or lower.startswith("with")):
+        return False, "Only SELECT queries are allowed for custom rules"
+
+    blocked = [
+        "insert", "update", "delete", "merge", "drop", "alter",
+        "create", "truncate", "grant", "revoke", "call", "execute",
+    ]
+    for kw in blocked:
+        if re.search(rf"\\b{kw}\\b", lower):
+            return False, f"Disallowed SQL keyword: {kw.upper()}"
+
+    return True, None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -459,12 +493,20 @@ if page == "🏗️ Build Rules":
     except Exception:
         pass
 
+    custom_sql_err = None
+    if tmpl["fields"] == ["custom_sql"]:
+        ok_sql, custom_sql_err = validate_custom_sql(fv.get("custom_sql", ""))
+        if not ok_sql:
+            st.error(custom_sql_err)
+
     if gen_sql:
         st.markdown("---")
         st.markdown("**Generated SQL:**")
         st.markdown(f'<div class="sql-box">{gen_sql}</div>', unsafe_allow_html=True)
 
     can_go = bool(gen_sql) and (bool(selected_table) or "custom_sql" in tmpl["fields"])
+    if tmpl["fields"] == ["custom_sql"] and custom_sql_err:
+        can_go = False
     st.markdown("---")
     a1, a2, a3 = st.columns(3)
 
