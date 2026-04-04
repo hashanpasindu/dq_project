@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd /Users/hashanpasindu/pocs/dq_project/dq_project/streamlit_app && /Users/hashanpasindu/pocs/dq_project/dq_project/\\.venv/bin/python - <<'PY'\nimport time\nfrom config import load_config\nfrom db import test_connection, discover_catalogs\n\ncfg = load_config\\(\\)\nif not cfg:\n    print\\('NO_SAVED_CONFIG'\\)\n    raise SystemExit\\(0\\)\n\nhost = cfg\\.get\\('hostname'\\)\npath = cfg\\.get\\('http_path'\\)\ntoken = cfg\\.get\\('token'\\)\nif not all\\(\\[host, path, token\\]\\):\n    print\\('INCOMPLETE_CONFIG'\\)\n    raise SystemExit\\(0\\)\n\nprint\\('START test_connection'\\)\nt0 = time\\.time\\(\\)\nok, msg = test_connection\\(host, path, token\\)\nprint\\('test_connection elapsed:', round\\(time\\.time\\(\\)-t0,2\\), 'ok:', ok\\)\nprint\\('message:', \\(msg or ''\\)\\[:220\\]\\)\n\nif ok:\n    print\\('START discover_catalogs'\\)\n    t1 = time\\.time\\(\\)\n    try:\n        cats = discover_catalogs\\(host, path, token\\)\n        print\\('discover_catalogs elapsed:', round\\(time\\.time\\(\\)-t1,2\\), 'count:', len\\(cats\\)\\)\n    except Exception as e:\n        print\\('discover_catalogs failed after', round\\(time\\.time\\(\\)-t1,2\\), 'err:', str\\(e\\)\\[:220\\]\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
