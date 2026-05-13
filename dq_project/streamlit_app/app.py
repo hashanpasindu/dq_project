@@ -350,6 +350,11 @@ if page == "🏗️ Build Rules":
         owner = st.text_input("👤 Owner", placeholder="data-eng")
     with c4:
         category = st.text_input("📁 Category", placeholder="sales")
+    pipeline_name = st.text_input(
+        "🔗 Pipeline Name (optional)",
+        placeholder="e.g. orders_daily — the runner will scope checks to this pipeline when pipeline_name is passed",
+        help="Tag this rule with a pipeline name. Pass the same name as the `pipeline_name` widget when triggering the validation runner at the end of that pipeline.",
+    )
 
     st.divider()
 
@@ -529,6 +534,7 @@ if page == "🏗️ Build Rules":
                 "rule_name": rule_name or tmpl_name.split(" ", 1)[1],
                 "rule_type": tmpl["key"], "rule_sql": gen_sql,
                 "severity": severity, "owner": owner, "category": category,
+                "tags": f"pipeline:{pipeline_name.strip()}" if pipeline_name.strip() else "",
                 "created_by": "streamlit",
             })
             st.toast(f"✅ {rid} queued")
@@ -542,6 +548,7 @@ if page == "🏗️ Build Rules":
                 "rule_name": rule_name or tmpl_name.split(" ", 1)[1],
                 "rule_type": tmpl["key"], "rule_sql": gen_sql,
                 "severity": severity, "owner": owner, "category": category,
+                "tags": f"pipeline:{pipeline_name.strip()}" if pipeline_name.strip() else "",
                 "created_by": "streamlit",
             }
             with st.spinner("Pushing..."):
@@ -571,14 +578,34 @@ if page == "🏗️ Build Rules":
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "📋 Manage Rules":
     st.markdown("## 📋 Manage Existing Rules")
+
+    def env_from_catalog_name(catalog_name: str) -> str:
+        c = (catalog_name or "").lower()
+        if "prod" in c:
+            return "prod"
+        if "uat" in c or "test" in c:
+            return "test"
+        return "dev"
+
+    env_options = ["dev", "test", "prod"]
+    default_env = env_from_catalog_name(st.session_state.dbx_config.get("dq_catalog", ""))
+    default_env_idx = env_options.index(default_env) if default_env in env_options else 0
+    manage_env = st.selectbox(
+        "🧭 Manage Environment",
+        env_options,
+        index=default_env_idx,
+        format_func=lambda x: x.upper(),
+        help="Manage rules in DEV, TEST/UAT, or PROD separately",
+    )
+
     try:
-        _, rows = get_all_rules()
+        _, rows = get_all_rules(manage_env)
     except Exception as e:
         st.error(f"Failed: {e}")
         st.stop()
 
     if not rows:
-        st.info("No rules found. Go to **Build Rules** to create your first rule.")
+        st.info(f"No rules found in {manage_env.upper()}. Go to **Build Rules** to create your first rule.")
         st.stop()
 
     st.markdown("### 🚚 Promote Rules: Dev → Test → Prod")
@@ -594,7 +621,7 @@ elif page == "📋 Manage Rules":
 
     promote_candidates = []
     for row in rows:
-        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
+        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok, tags = row
         dataset = str(ds or "")
         if selected_promote_table != "All tables" and dataset != selected_promote_table:
             continue
@@ -628,21 +655,42 @@ elif page == "📋 Manage Rules":
             return "dev"
         return "unknown"
 
+    env_catalog_options = [
+        c for c in promote_catalog_options
+        if promotion_env_key(c) in {"dev", "test", "prod"}
+    ]
+
+    promotion_mode = st.selectbox(
+        "Promotion Type",
+        ["dev -> uat/test", "uat/test -> prod"],
+        key="promotion_mode",
+        help="Select which promotion flow you want to run",
+    )
+
+    allowed_source_env = "dev" if promotion_mode == "dev -> uat/test" else "test"
+    allowed_target_env = "test" if promotion_mode == "dev -> uat/test" else "prod"
+
+    source_catalog_options = [
+        c for c in env_catalog_options
+        if promotion_env_key(c) == allowed_source_env
+    ]
+
     p1, p2 = st.columns(2)
     with p1:
         source_catalog = st.selectbox(
             "Source Data Catalog",
-            [""] + promote_catalog_options,
+            [""] + source_catalog_options,
             key="promote_src",
             format_func=lambda x: "— Select source catalog —" if not x else x,
-            help="Type to search catalogs",
+            help="Only catalogs valid for the selected promotion type are shown",
         )
     with p2:
         source_env = promotion_env_key(source_catalog)
-        if source_env == "dev":
-            allowed_targets = [c for c in promote_catalog_options if promotion_env_key(c) == "test"]
-        elif source_env == "test":
-            allowed_targets = [c for c in promote_catalog_options if promotion_env_key(c) == "prod"]
+        if source_env == allowed_source_env:
+            allowed_targets = [
+                c for c in env_catalog_options
+                if promotion_env_key(c) == allowed_target_env
+            ]
         else:
             allowed_targets = []
 
@@ -651,7 +699,7 @@ elif page == "📋 Manage Rules":
             [""] + allowed_targets,
             key="promote_tgt",
             format_func=lambda x: "— Select target catalog —" if not x else x,
-            help="Allowed: dev -> test/uat, test/uat -> prod",
+            help="Targets follow the selected promotion type",
         )
 
     selected_rule_ids = [promote_option_to_id[x] for x in selected_promotion_options]
@@ -708,9 +756,28 @@ elif page == "📋 Manage Rules":
 
     st.divider()
 
-    total = len(rows)
-    active = sum(1 for r in rows if r[8])
-    crit = sum(1 for r in rows if r[5] == "critical" and r[8])
+    search_env = st.selectbox(
+        "🔎 Search Environment",
+        env_options,
+        index=env_options.index(manage_env),
+        format_func=lambda x: x.upper(),
+        help="Search and manage rules in the selected environment",
+        key="search_rules_env",
+    )
+
+    try:
+        _, search_rows = get_all_rules(search_env)
+    except Exception as e:
+        st.error(f"Failed to load search environment rules: {e}")
+        st.stop()
+
+    if not search_rows:
+        st.info(f"No rules found in {search_env.upper()} for search.")
+        st.stop()
+
+    total = len(search_rows)
+    active = sum(1 for r in search_rows if r[8])
+    crit = sum(1 for r in search_rows if r[5] == "critical" and r[8])
 
     s1, s2, s3 = st.columns(3)
     with s1:
@@ -724,7 +791,7 @@ elif page == "📋 Manage Rules":
 
     rule_search_options = [
         f"{r[0]} | {r[2]} | {r[1]} | {r[3]}"
-        for r in rows
+        for r in search_rows
     ]
     selected_rule_search = st.multiselect(
         "🔍 Search rules",
@@ -733,21 +800,23 @@ elif page == "📋 Manage Rules":
     )
     selected_rule_ids_for_view = {opt.split(" | ", 1)[0] for opt in selected_rule_search}
 
-    for row in rows:
-        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok = row
+    for row in search_rows:
+        rid, ds, rname, rtype, rsql, sev, cat, own, is_active, last_at, last_ok, tags = row
         if selected_rule_ids_for_view and rid not in selected_rule_ids_for_view:
             continue
 
         dot = "🟢" if is_active else "⚪"
         sev_h = f'<span class="sev-{sev}">{sev}</span>'
         last_icon = "✅" if last_ok else ("❌" if last_ok is False else "—")
+        _pl = next((t.strip()[9:] for t in (tags or "").split(",") if t.strip().startswith("pipeline:")), "")
 
         st.markdown(
             f'<div class="card">{dot} <span class="tag">{rid}</span> {sev_h} '
             f'<span style="color:#64748b;font-size:12px;">{rtype} · {cat or ""}</span> '
             f'<span style="float:right;">{last_icon}</span><br>'
             f'<b style="color:#f1f5f9;font-size:15px;">{rname}</b><br>'
-            f'<span style="color:#64748b;font-size:12px;">{ds} · Owner: {own or "—"}</span>'
+            f'<span style="color:#64748b;font-size:12px;">{ds} · Owner: {own or "—"}'
+            f'{(" · 🔗 " + _pl) if _pl else ""}</span>'
             f'<div class="sql-box" style="font-size:11px;margin-top:6px;">{rsql}</div></div>',
             unsafe_allow_html=True)
 
@@ -765,11 +834,11 @@ elif page == "📋 Manage Rules":
         with b2:
             lbl = "⏸️ Disable" if is_active else "▶️ Enable"
             if st.button(lbl, key=f"tog_{rid}", use_container_width=True):
-                toggle_rule(rid, not is_active)
+                toggle_rule(rid, not is_active, search_env)
                 st.rerun()
         with b3:
             if st.button("🗑️ Delete", key=f"del_{rid}", use_container_width=True):
-                delete_rule(rid)
+                delete_rule(rid, search_env)
                 st.toast(f"Deleted {rid}")
                 st.rerun()
 

@@ -448,17 +448,19 @@ def push_rule(rule: dict) -> tuple[bool, str | None]:
             rule_sql  = '{esc(rule["rule_sql"])}',
             severity  = '{rule["severity"]}',
             category  = '{esc(rule.get("category", ""))}',
+            tags      = '{esc(rule.get("tags", ""))}',
             owner     = '{esc(rule.get("owner", ""))}',
             active    = true,
             updated_by = '{esc(rule.get("updated_by", "streamlit"))}',
             updated_at = current_timestamp()
         WHEN NOT MATCHED THEN INSERT (
             rule_id, rule_name, dataset, rule_type, rule_sql, severity,
-            category, owner, active, created_by, created_at, updated_at
+            category, tags, owner, active, created_by, created_at, updated_at
         ) VALUES (
             '{rule["rule_id"]}', '{esc(rule["rule_name"])}', '{esc(rule["dataset"])}',
             '{esc(rule["rule_type"])}', '{esc(rule["rule_sql"])}', '{rule["severity"]}',
-            '{esc(rule.get("category", ""))}', '{esc(rule.get("owner", ""))}', true,
+            '{esc(rule.get("category", ""))}', '{esc(rule.get("tags", ""))}',
+            '{esc(rule.get("owner", ""))}', true,
             '{esc(rule.get("created_by", "streamlit"))}', current_timestamp(), current_timestamp()
         )
     """
@@ -471,9 +473,9 @@ def push_rule(rule: dict) -> tuple[bool, str | None]:
         return False, str(e)
 
 
-def toggle_rule(rule_id: str, active: bool):
+def toggle_rule(rule_id: str, active: bool, catalog: str | None = None):
     """Enable or disable a rule."""
-    rules_tbl = dq_table("rules")
+    rules_tbl = dq_table("rules", catalog)
     run_sql(
         f"UPDATE {rules_tbl} SET active={str(active).lower()}, "
         f"updated_at=current_timestamp() WHERE rule_id='{rule_id}'",
@@ -483,26 +485,26 @@ def toggle_rule(rule_id: str, active: bool):
     log_audit(rule_id, action)
 
 
-def delete_rule(rule_id: str):
+def delete_rule(rule_id: str, catalog: str | None = None):
     """Delete a rule permanently."""
-    rules_tbl = dq_table("rules")
+    rules_tbl = dq_table("rules", catalog)
     run_sql(f"DELETE FROM {rules_tbl} WHERE rule_id='{rule_id}'", fetch=False)
     log_audit(rule_id, "DELETED")
 
 
-def get_all_rules():
+def get_all_rules(catalog: str | None = None):
     """Fetch all rules ordered by rule_id."""
-    rules_tbl = dq_table("rules")
+    rules_tbl = dq_table("rules", catalog)
     return run_sql("""
         SELECT rule_id, dataset, rule_name, rule_type, rule_sql,
-               severity, category, owner, active, last_run_at, last_run_passed
+               severity, category, owner, active, last_run_at, last_run_passed, tags
         FROM {rules_tbl} ORDER BY rule_id
     """.format(rules_tbl=rules_tbl))
 
 
-def get_active_rules():
+def get_active_rules(catalog: str | None = None):
     """Fetch only active rules."""
-    rules_tbl = dq_table("rules")
+    rules_tbl = dq_table("rules", catalog)
     return run_sql("""
         SELECT rule_id, dataset, rule_name, rule_type, rule_sql,
                severity, owner, active

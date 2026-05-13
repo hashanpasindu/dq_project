@@ -1,92 +1,109 @@
-# 🛡️ Data Quality Validation Framework — End-to-End Project
+# Data Quality Validation Framework
 
----
+## Overview
+
+This project provides an end-to-end Data Quality framework with:
+
+- A Streamlit app to build, test, promote, and manage DQ rules
+- Databricks backend Delta tables for rules, results, audit, and alerts
+- A Databricks validation runner notebook for scheduled execution
 
 ## Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         DQ VALIDATION SYSTEM                            │
-│                                                                          │
-│   LOCAL MACHINE                        DATABRICKS WORKSPACE              │
-│  ┌─────────────────┐                  ┌────────────────────────────┐     │
-│  │  Streamlit App   │───── PAT ───────▶│  SQL Warehouse             │     │
-│  │  (Rule Builder)  │  CRUD rules      │  (Executes all queries)    │     │
-│  │  localhost:8501  │◀── results ──────│                            │     │
-│  └─────────────────┘                  └────────────┬───────────────┘     │
-│                                                     │                    │
-│                                        ┌────────────▼───────────────┐    │
-│                                        │  BACKEND DELTA TABLES       │    │
-│                                        │  (Unity Catalog)            │    │
-│                                        │                             │    │
-│                                        │  data_quality.rules_<env>   │    │
-│                                        │  data_quality.results_<env> │    │
-│                                        │  data_quality.rule_audit_<env> │ │
-│                                        │  data_quality.alert_config_<env>│ │
-│                                        │  data_quality.alert_log_<env> │ │
-│                                        └────────────┬───────────────┘    │
-│                                                     │                    │
-│                                        ┌────────────▼───────────────┐    │
-│                                        │  VALIDATION RUNNER          │    │
-│                                        │  (Scheduled Databricks Job) │    │
-│                                        │  Reads rules → Executes     │    │
-│                                        │  → Writes results           │    │
-│                                        │  → Sends alerts             │    │
-│                                        └────────────┬───────────────┘    │
-│                                                     │                    │
-│                                          ┌──────────┴──────────┐         │
-│                                          ▼                    ▼          │
-│                                   ┌────────────┐     ┌──────────────┐    │
-│                                   │  MS Teams   │     │  Email       │    │
-│                                   │  Alerts     │     │  Alerts      │    │
-│                                   └────────────┘     └──────────────┘    │
-└──────────────────────────────────────────────────────────────────────────┘
+Local Machine                                              Databricks Workspace
+┌──────────────────────────────┐                          ┌──────────────────────────────────────────────┐
+│ Streamlit App                │                          │ SQL Warehouse                                │
+│ - Build Rules                │   PAT + HTTP Path        │ - Executes rule SQL                          │
+│ - Manage Rules               │─────────────────────────>│ - Serves metadata and catalogs               │
+│ - Run History / Audit        │<─────────────────────────│ - Handles reads/writes to UC tables          │
+└───────────────┬──────────────┘                          └───────────────────┬──────────────────────────┘
+                │                                                           │
+                │                                                           │
+                │                                         Unity Catalog: data_quality
+                │                                         ┌──────────────────────────────────────────────┐
+                │                                         │ Schemas:                                     │
+                │                                         │ - dev_rules                                  │
+                │                                         │ - test_rules                                 │
+                │                                         │ - prod_rules                                 │
+                │                                         │                                              │
+                │                                         │ Tables per schema:                           │
+                │                                         │ - rules                                      │
+                │                                         │ - results                                    │
+                │                                         │ - rule_audit                                 │
+                │                                         │ - alert_config                               │
+                │                                         │ - alert_log                                  │
+                │                                         └───────────────────┬──────────────────────────┘
+                │                                                             │
+                │                                                             │
+                │                               Databricks Workflow (scheduled)
+                │                          ┌──────────────────────────────────────────────┐
+                └─────────────────────────>│ notebooks/dq_validation_runner.py           │
+                                           │ - Reads active rules for selected env        │
+                                           │ - Executes checks                            │
+                                           │ - Writes results + audit updates             │
+                                           │ - Triggers alerts (Email / Teams)            │
+                                           └──────────────────────────────────────────────┘
 ```
+
+### Environment Routing
+
+- `dq_env=dev` -> `data_quality.dev_rules.*`
+- `dq_env=test` -> `data_quality.test_rules.*`
+- `dq_env=prod` -> `data_quality.prod_rules.*`
+
+## Current Backend Model
+
+Backend objects are organized in a dedicated Unity Catalog catalog named `data_quality`, with separate schemas per environment:
+
+- `data_quality.dev_rules`
+- `data_quality.test_rules`
+- `data_quality.prod_rules`
+
+Each schema contains:
+
+- `rules`
+- `results`
+- `rule_audit`
+- `alert_config`
+- `alert_log`
 
 ## Project Structure
 
 ```text
 dq_project/
-│
-├── README.md                          ← You are here
-│
+├── README.md
 ├── backend/
-│   ├── 01_create_tables.sql           ← All DDL — run once in Databricks
-│   ├── 02_seed_sample_rules.sql       ← Example rules to get started
-│   └── 03_useful_queries.sql          ← Dashboard & diagnostic queries
-│
+│   ├── 01_create_tables.sql
+│   ├── 02_seed_sample_rules.sql
+│   └── 03_useful_queries.sql
 ├── notebooks/
-│   ├── dq_validation_runner.py        ← Scheduled job — runs all rules
-│   └── dq_setup_bootstrap.py         ← One-click setup notebook
-│
+│   ├── dq_setup_bootstrap.py
+│   └── dq_validation_runner.py
 ├── streamlit_app/
-│   ├── app.py                         ← The Streamlit Rule Builder
-│   ├── db.py                          ← Databricks connection & queries
-│   ├── templates.py                   ← Rule template definitions
-│   ├── config.py                      ← Local config management
-│   └── requirements.txt               ← Python dependencies
-│
+│   ├── app.py
+│   ├── config.py
+│   ├── db.py
+│   ├── requirements.txt
+│   └── templates.py
 └── docs/
-    └── table_dictionary.md            ← Column-level documentation
+    └── table_dictionary.md
 ```
 
 ## Quick Start
 
-### Step 1: Create backend tables
+### 1. Create `data_quality` catalog first
 
-Recommended: connect from the Streamlit app and let it auto-bootstrap tables in your selected catalog.
+The app does not auto-create the catalog anymore.
 
-Notes:
+Create `data_quality` in Databricks Catalog Explorer (UI), or create it with explicit managed location:
 
-- The app now creates environment-scoped tables based on catalog name:
-- contains `dev` -> `_dev`
-- contains `test` or `uat` -> `_uat`
-- contains `prod` -> `_prod`
-- Example tables: `data_quality.rules_dev`, `data_quality.results_uat`, `data_quality.alert_log_prod`.
+```sql
+CREATE CATALOG data_quality
+MANAGED LOCATION 'abfss://<container>@<storage-account>.dfs.core.windows.net/<path>';
+```
 
-Optional: you can still run `backend/01_create_tables.sql` manually for baseline setup.
-
-### Step 2: Launch the Streamlit app
+### 2. Start Streamlit app
 
 ```bash
 cd streamlit_app
@@ -94,40 +111,66 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-### Step 3: Schedule the validation runner
+### 3. Connect and bootstrap
 
-Import `notebooks/dq_validation_runner.py` into Databricks and schedule as a Workflow.
+In the Streamlit sidebar, connect to your Databricks SQL Warehouse.
 
-Required job parameter:
+On first successful connect, the app creates required schemas/tables for:
 
-- `dq_catalog`: catalog to run against (for example `aa_data_dev`, `aa_data_dev_test`, `aa_data_prod`)
-- `pipeline_tables` (optional): comma/semicolon/newline separated table names to run only relevant rules
+- `dev_rules`
+- `test_rules`
+- `prod_rules`
+
+## Build Rules Behavior
+
+- Build Rules catalog picker only shows catalogs containing `dev`.
+- For custom rules, only a single read-only SQL query is allowed.
+- Allowed custom SQL starts with `SELECT` or `WITH`.
+- Disallowed keywords include `DELETE`, `UPDATE`, `INSERT`, `MERGE`, `DROP`, `ALTER`, and other non-read-only operations.
+
+## Manage Rules Behavior
+
+Manage Rules supports environment-specific operations.
+
+- Use `Manage Environment` selector to manage `DEV`, `TEST`, or `PROD` separately.
+- List, enable/disable, and delete are scoped to the selected environment.
+
+### Promotion
+
+Promotion is done from the Manage Rules page using dropdown catalog selectors.
+
+Allowed promotion paths only:
+
+- `dev` -> `uat/test`
+- `uat/test` -> `prod`
+
+During promotion:
+
+- Selected rules are copied/merged from source env rules table into target env rules table.
+- Catalog references in `dataset` and `rule_sql` are remapped from source catalog to target catalog.
+
+## Validation Runner Notebook
+
+Notebook: `notebooks/dq_validation_runner.py`
+
+Workflow parameters:
+
+- `dq_backend_catalog` (default: `data_quality`)
+- `dq_env` (`dev`, `test`, or `prod`)
+- `pipeline_tables` (optional)
 
 Runner behavior:
 
-- Reads from `data_quality.rules_<env>` in the provided catalog
-- Writes to `data_quality.results_<env>`
-- Uses matching env-scoped alert and audit tables
-- If `pipeline_tables` is provided, only rules whose `dataset` matches those tables are executed
+- Reads active rules from `<dq_backend_catalog>.<env_schema>.rules`
+- Executes each rule SQL
+- Writes results to `<dq_backend_catalog>.<env_schema>.results`
+- Updates rule run status (`last_run_at`, `last_run_passed`)
+- Sends alerts using `<dq_backend_catalog>.<env_schema>.alert_config`
+- Logs alert outcomes in `<dq_backend_catalog>.<env_schema>.alert_log`
 
-`pipeline_tables` examples:
+`pipeline_tables` accepts comma/semicolon/newline-separated table names to run only matching rules.
 
-- `aa_data_dev.gold.avaya_user_activity`
-- `aa_data_dev.gold.avaya_user_activity,aa_data_dev.gold.orders`
-- `gold.avaya_user_activity;gold.orders`
+## Notes
 
-## Promotion (Dev/Test/UAT/Prod)
-
-Use the `Manage Rules` page in Streamlit:
-
-1. Search by table name
-2. Select specific rules to promote
-3. Provide source catalog and target catalog
-4. Run `Remap Catalog In Selected Rules`
-
-Example:
-
-- From: `aa_data_dev_test.gold.avaya_user_activity`
-- To: `aa_data_dev.gold.avaya_user_activity`
-- Source catalog: `aa_data_dev_test`
-- Target catalog: `aa_data_dev`
+- If sidebar is hidden, refresh the page; app defaults sidebar to expanded.
+- If SSL cert errors occur locally, provide a trusted CA path in sidebar connection settings.

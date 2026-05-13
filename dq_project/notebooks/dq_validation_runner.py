@@ -29,6 +29,8 @@ dbutils.widgets.dropdown("dq_env", "dev", ["dev", "test", "prod"])
 DQ_ENV = dbutils.widgets.get("dq_env").strip().lower() or "dev"
 dbutils.widgets.text("pipeline_tables", "")
 PIPELINE_TABLES_RAW = dbutils.widgets.get("pipeline_tables").strip()
+dbutils.widgets.text("pipeline_name", "")
+PIPELINE_NAME = dbutils.widgets.get("pipeline_name").strip()
 
 
 if DQ_ENV not in ("dev", "test", "prod"):
@@ -80,9 +82,11 @@ pipeline_match_set = set()
 for item in pipeline_inputs:
     pipeline_match_set.update(build_match_keys(item))
 
-RUN_TYPE = "pipeline" if pipeline_match_set else "scheduled"
+RUN_TYPE = "pipeline" if (pipeline_match_set or PIPELINE_NAME) else "scheduled"
 if pipeline_match_set:
     print(f"🎯 Pipeline table filter enabled ({len(pipeline_inputs)} inputs)")
+elif PIPELINE_NAME:
+    print(f"🎯 Pipeline name filter enabled: '{PIPELINE_NAME}'")
 
 # COMMAND ----------
 
@@ -96,6 +100,13 @@ if pipeline_match_set:
         if bool(build_match_keys(r.dataset or "") & pipeline_match_set)
     ]
     print(f"📋 Loaded {len(rules_all)} active rules | {len(rules)} matched pipeline tables")
+elif PIPELINE_NAME:
+    tag_key = f"pipeline:{PIPELINE_NAME.lower()}"
+    rules = [
+        r for r in rules_all
+        if tag_key in (r.tags or "").lower()
+    ]
+    print(f"📋 Loaded {len(rules_all)} active rules | {len(rules)} matched pipeline name '{PIPELINE_NAME}'")
 else:
     rules = rules_all
     print(f"📋 Loaded {len(rules)} active rules")
